@@ -169,7 +169,11 @@ app.options('/upload', (req, res) => {
 });
 
 app.post('/upload', (req, res) => {
-  const form = formidable({ multiples: false, uploadDir: UPLOAD_DIR, keepExtensions: true });
+  const form = new formidable.IncomingForm({ 
+    multiples: false, 
+    uploadDir: UPLOAD_DIR, 
+    keepExtensions: true 
+  });
   form.parse(req, async (err, fields, files) => {
     if (err) {
       res.status(500).json({error: err.message});
