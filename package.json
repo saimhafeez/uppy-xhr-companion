@@ -3,11 +3,7 @@
   "version": "1.0.0",
   "description": "Merged Uppy Companion and XHR endpoint server, deployable on Render",
   "main": "server.js",
-  "type": "commonjs",
   "scripts": {
     "start": "node server.js"
-  },
-  "engines": {
-    "node": ">=18.0.0"
   }
 }
