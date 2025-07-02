@@ -12,16 +12,15 @@ const path = require('path');
 const cors = require('cors');
 
 // Wasabi Config (Use process.env for secrets in real deploys!)
-const WASABI_BUCKET = process.env.WASABI_BUCKET || 'upward';
-const WASABI_REGION = process.env.WASABI_REGION || 'us-east-2';
-const WASABI_ENDPOINT = process.env.WASABI_ENDPOINT || 'https://s3.us-east-2.wasabisys.com';
-const WASABI_KEY = process.env.WASABI_KEY || 'HZOUCM9I2D1MI9HGYL5A';
-const WASABI_SECRET = process.env.WASABI_SECRET || 'wbD9rW8BG08UgX6z19kRa7nc7hzl16vRhEv3TIE6';
+const WASABI_BUCKET = process.env.WASABI_BUCKET;
+const WASABI_REGION = process.env.WASABI_REGION;
+const WASABI_ENDPOINT = process.env.WASABI_ENDPOINT;
+const WASABI_KEY = process.env.WASABI_KEY;
+const WASABI_SECRET = process.env.WASABI_SECRET;
 
 // Mux Config
-const MUX_TOKEN_ID = process.env.MUX_TOKEN_ID || "6b6f9f5c-61d8-4a79-8428-1b38a3a08c0e";
-const MUX_TOKEN_SECRET = process.env.MUX_TOKEN_SECRET || "B7VRg2PQjIQ8kE57KDr64HX9B5/8DMO9rJWRgeYuR7TMIpZQSpWRTJVS/P/iynYgFeUat2T/KtS";
-const MUX_API_URL = process.env.MUX_API_URL || 'https://api.mux.com/video/v1/assets';
+const MUX_TOKEN_ID = process.env.MUX_TOKEN_ID;
+const MUX_TOKEN_SECRET = process.env.MUX_TOKEN_SECRET;
 
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
 fs.mkdir(UPLOAD_DIR, { recursive: true }).catch(() => {});
