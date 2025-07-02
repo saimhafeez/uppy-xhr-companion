@@ -1,50 +1,46 @@
-// index.js
-import express from 'express'
-import formidable from 'formidable'
-import fetch from 'node-fetch'
-import fs from 'node:fs/promises'
-import { fileURLToPath } from 'node:url'
-import { mkdir } from 'node:fs/promises'
-import { randomUUID } from 'crypto'
-import AWS from 'aws-sdk'
-import session from 'express-session'
-import bodyParser from 'body-parser'
-import * as dotenv from 'dotenv'
-import { app as companionApp, socket as companionSocket } from '@uppy/companion'
+require('dotenv').config();
+const express = require('express');
+const session = require('express-session');
+const bodyParser = require('body-parser');
+const companion = require('@uppy/companion');
+const formidable = require('formidable');
+const fs = require('fs/promises');
+const AWS = require('aws-sdk');
+const fetch = require('node-fetch');
+const { randomUUID } = require('crypto');
+const path = require('path');
+const cors = require('cors');
 
-// Load .env
-dotenv.config()
+// Wasabi Config (Use process.env for secrets in real deploys!)
+const WASABI_BUCKET = process.env.WASABI_BUCKET || 'upward';
+const WASABI_REGION = process.env.WASABI_REGION || 'us-east-2';
+const WASABI_ENDPOINT = process.env.WASABI_ENDPOINT || 'https://s3.us-east-2.wasabisys.com';
+const WASABI_KEY = process.env.WASABI_KEY || 'HZOUCM9I2D1MI9HGYL5A';
+const WASABI_SECRET = process.env.WASABI_SECRET || 'wbD9rW8BG08UgX6z19kRa7nc7hzl16vRhEv3TIE6';
 
-// env safety: set all these in Render.com ENV vars!
-const {
-  GOOGLE_KEY, GOOGLE_SECRET,
-  DROPBOX_KEY, DROPBOX_SECRET,
-  ONEDRIVE_KEY, ONEDRIVE_SECRET,
-  COMPANION_SECRET,
-  COMPANION_DOMAIN,
-  WASABI_BUCKET, WASABI_REGION, WASABI_ENDPOINT, WASABI_KEY, WASABI_SECRET,
-  MUX_TOKEN_ID, MUX_TOKEN_SECRET
-} = process.env
+// Mux Config
+const MUX_TOKEN_ID = process.env.MUX_TOKEN_ID || "6b6f9f5c-61d8-4a79-8428-1b38a3a08c0e";
+const MUX_TOKEN_SECRET = process.env.MUX_TOKEN_SECRET || "B7VRg2PQjIQ8kE57KDr64HX9B5/8DMO9rJWRgeYuR7TMIpZQSpWRTJVS/P/iynYgFeUat2T/KtS";
+const MUX_API_URL = process.env.MUX_API_URL || 'https://api.mux.com/video/v1/assets';
 
-// For file uploads (see Render's docs about /tmp dir)
-const UPLOAD_DIR = '/opt/render/project/tmp/uploads'
-await mkdir(UPLOAD_DIR, { recursive: true })
+const UPLOAD_DIR = path.join(__dirname, 'uploads');
+fs.mkdir(UPLOAD_DIR, { recursive: true }).catch(() => {});
 
-// AWS Client
+// S3: Wasabi
 const s3 = new AWS.S3({
   endpoint: WASABI_ENDPOINT,
   region: WASABI_REGION,
   accessKeyId: WASABI_KEY,
   secretAccessKey: WASABI_SECRET,
   signatureVersion: 'v4',
-})
+});
 
-const isVideoOrAudio = (mimetype) =>
+const isVideoOrAudio = mimetype =>
   mimetype && (
     mimetype.startsWith('video/') ||
     mimetype.startsWith('audio/') ||
     mimetype === 'application/mp4'
-  )
+  );
 
 async function uploadToWasabi({ fileData, wasabiKey, mimetype }) {
   const url = await s3.getSignedUrlPromise('putObject', {
@@ -52,12 +48,16 @@ async function uploadToWasabi({ fileData, wasabiKey, mimetype }) {
     Key: wasabiKey,
     ContentType: mimetype || 'application/octet-stream',
     Expires: 600,
-  })
+    ACL: 'public-read',
+  });
   const resp = await fetch(url, {
     method: 'PUT',
-    headers: { 'Content-Type': mimetype || 'application/octet-stream' },
+    headers: {
+      'Content-Type': mimetype || 'application/octet-stream',
+      'x-amz-acl': 'public-read'
+    },
     body: fileData,
-  })
+  });
   if (!resp.ok) {
     const msg = await resp.text()
     throw new Error(`Wasabi PUT failed: ${resp.status} - ${msg}`)
@@ -68,7 +68,6 @@ async function uploadToWasabi({ fileData, wasabiKey, mimetype }) {
 async function uploadToMux({ fileData, mimetype, originalFilename }) {
   const external_id = randomUUID();
 
-  // 1. Create direct upload URL
   const response = await fetch('https://api.mux.com/video/v1/uploads', {
     method: 'POST',
     headers: {
@@ -82,7 +81,7 @@ async function uploadToMux({ fileData, mimetype, originalFilename }) {
         meta: { external_id }
       }
     })
-  })
+  });
   if (!response.ok) {
     const text = await response.text();
     throw new Error(`MUX upload create failed: ${response.status}: ${text}`)
@@ -91,7 +90,6 @@ async function uploadToMux({ fileData, mimetype, originalFilename }) {
   const upload_url = json.data.url;
   const upload_id = json.data.id;
 
-  // 2. Upload the vid to mux
   const uploadResp = await fetch(upload_url, {
     method: 'PUT',
     headers: {
@@ -99,103 +97,126 @@ async function uploadToMux({ fileData, mimetype, originalFilename }) {
       'Origin': '*'
     },
     body: fileData
-  })
+  });
   if (!uploadResp.ok) {
     const text = await uploadResp.text();
     throw new Error(`MUX upload PUT failed: ${uploadResp.status}: ${text}`)
   }
 
-  return { mux_upload_id: upload_id, upload_url, external_id }
+  return {
+    mux_upload_id: upload_id,
+    upload_url,
+    external_id
+  };
 }
 
-const app = express()
-app.use(bodyParser.json())
+// ---- Express Setup
+
+const app = express();
+
+// --- Generic CORS for all API endpoints
+app.use(cors({ origin: '*', credentials: false }));
+
+// --- Body parser (for session/cookies)
+app.use(bodyParser.json({ limit: '50mb' }));
+
 app.use(session({
-  secret: COMPANION_SECRET,
+  secret: process.env.COMPANION_SECRET,
   resave: false,
   saveUninitialized: true,
   cookie: {
-    secure: false,       // For HTTP/WS in development. Set true in prod over HTTPS.
+    secure: false,       // must be false unless on HTTPS custom domain!
     sameSite: 'lax',
     maxAge: 24 * 60 * 60 * 1000
   }
-}))
+}));
 
-// ---- Uppy Companion Middleware ----
-const companionOptions = {
+// ---- Uppy Companion middleware (cloud providers)
+const options = {
   providerOptions: {
-    drive: { key: GOOGLE_KEY, secret: GOOGLE_SECRET },
-    dropbox: { key: DROPBOX_KEY, secret: DROPBOX_SECRET },
-    onedrive: { key: ONEDRIVE_KEY, secret: ONEDRIVE_SECRET }
+    drive: {
+      key: process.env.GOOGLE_KEY,
+      secret: process.env.GOOGLE_SECRET
+    },
+    dropbox: {
+      key: process.env.DROPBOX_KEY,
+      secret: process.env.DROPBOX_SECRET
+    },
+    onedrive: {
+      key: process.env.ONEDRIVE_KEY,
+      secret: process.env.ONEDRIVE_SECRET
+    }
   },
   server: {
-    host: COMPANION_DOMAIN,
+    host: process.env.COMPANION_DOMAIN,
     protocol: 'https'
   },
-  filePath: '/opt/render/project/tmp',
-  secret: COMPANION_SECRET,
+  filePath: '/tmp',
+  secret: process.env.COMPANION_SECRET,
   debug: true,
-  uploadUrls: ['.*'] // allow all
-}
-app.use(companionApp(companionOptions))
+  uploadUrls: ['.*']
+};
 
-// ---- XHR Upload Endpoint (/upload) ----
+const { app: companionApp } = companion.app(options);
+app.use(companionApp);
+
+// ---- Your /upload endpoint!
+app.options('/upload', (req, res) => {
+  // CORS options/preflight
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'GET, OPTIONS, POST');
+  res.set('Access-Control-Allow-Headers', 'Content-Type');
+  res.status(204).end();
+});
+
 app.post('/upload', (req, res) => {
-  const form = formidable({ multiples: false, uploadDir: UPLOAD_DIR, keepExtensions: true })
-
+  const form = formidable({ multiples: false, uploadDir: UPLOAD_DIR, keepExtensions: true });
   form.parse(req, async (err, fields, files) => {
-    const headers = {
-      'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'OPTIONS, POST, GET',
-      'Access-Control-Max-Age': 2592000,
-    }
     if (err) {
-      res.writeHead(500, headers)
-      res.end(JSON.stringify({ error: err.message }))
-      return
+      res.status(500).json({error: err.message});
+      return;
     }
     try {
-      const uploaded = (files.file && files.file[0]) || files[Object.keys(files)[0]][0]
-      const { filepath, originalFilename, mimetype, size } = uploaded
-      const timestamp = Date.now()
-      const safeName = originalFilename.replace(/[^\w.\-]/g, '_')
-      const fileData = await fs.readFile(filepath)
+      const uploaded = (files.file && files.file[0]) || files[Object.keys(files)[0]][0];
+      const { filepath, originalFilename, mimetype, size } = uploaded;
+      const timestamp = Date.now();
+      const safeName = originalFilename.replace(/[^\w.\-]/g, '_');
+      const fileData = await fs.readFile(filepath);
 
-      let result = {}
+      let result = {};
       if (isVideoOrAudio(mimetype)) {
-        result = await uploadToMux({ fileData, mimetype, originalFilename })
+        result = await uploadToMux({ fileData, mimetype, originalFilename });
       } else {
-        const wasabiKey = `${timestamp}_${safeName}`
-        const url = await uploadToWasabi({ fileData, wasabiKey, mimetype })
-        result = { wasabi_url: url }
+        const wasabiKey = `${timestamp}_${safeName}`;
+        const url = await uploadToWasabi({ fileData, wasabiKey, mimetype });
+        result = { wasabi_url: url };
       }
 
-      await fs.unlink(filepath).catch(() => { })
+      await fs.unlink(filepath).catch(() => {});
 
-      res.writeHead(200, headers)
-      res.end(JSON.stringify({
+      res.status(200).json({
         ok: true,
         filename: originalFilename,
         mimetype,
         size,
         ...result
-      }))
+      });
     } catch (e) {
-      res.writeHead(500, headers)
-      res.end(JSON.stringify({ error: e.message }))
+      res.status(500).json({ error: e.message });
     }
-  })
-})
+  });
+});
 
-// ---- Optionally health check ----
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok' })
-})
+// ---- 404 fallback
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
 
-const PORT = process.env.PORT || 3020
+// ---- Start up, enable ws
+const PORT = process.env.PORT || 3020;
 const server = app.listen(PORT, () => {
-  console.log(`Server started on http://localhost:${PORT}`)
-})
-// WebSocket for Companion status
-companionSocket(server, companionOptions)
+  console.log(`✅ Server running at port ${PORT}`);
+});
+
+// ---- WebSockets for Companion events (must pass the http.Server instance)
+companion.socket(server, options);
