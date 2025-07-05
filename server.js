@@ -5,13 +5,14 @@ const bodyParser = require('body-parser');
 const companion = require('@uppy/companion');
 const formidable = require('formidable');
 const fs = require('fs/promises');
+const fsSync = require('fs'); // For fs.createReadStream
 const AWS = require('aws-sdk');
 const fetch = require('node-fetch');
 const { randomUUID } = require('crypto');
 const path = require('path');
 const cors = require('cors');
 
-// Wasabi Config (Use process.env for secrets in real deploys!)
+// Wasabi Config
 const WASABI_BUCKET = process.env.WASABI_BUCKET;
 const WASABI_REGION = process.env.WASABI_REGION;
 const WASABI_ENDPOINT = process.env.WASABI_ENDPOINT;
@@ -41,7 +42,11 @@ const isVideoOrAudio = mimetype =>
     mimetype === 'application/mp4'
   );
 
-async function uploadToWasabi({ fileData, wasabiKey, mimetype }) {
+// ---- Streaming upload helpers
+
+async function uploadToWasabi({ filepath, wasabiKey, mimetype }) {
+  const fileStream = fsSync.createReadStream(filepath);
+
   const url = await s3.getSignedUrlPromise('putObject', {
     Bucket: WASABI_BUCKET,
     Key: wasabiKey,
@@ -49,22 +54,24 @@ async function uploadToWasabi({ fileData, wasabiKey, mimetype }) {
     Expires: 600,
     ACL: 'public-read',
   });
+
   const resp = await fetch(url, {
     method: 'PUT',
     headers: {
       'Content-Type': mimetype || 'application/octet-stream',
       'x-amz-acl': 'public-read'
     },
-    body: fileData,
+    body: fileStream
   });
+
   if (!resp.ok) {
-    const msg = await resp.text()
+    const msg = await resp.text();
     throw new Error(`Wasabi PUT failed: ${resp.status} - ${msg}`)
   }
   return `https://${WASABI_BUCKET}.s3.${WASABI_REGION}.wasabisys.com/${wasabiKey}`;
 }
 
-async function uploadToMux({ fileData, mimetype, originalFilename }) {
+async function uploadToMux({ filepath, mimetype, originalFilename }) {
   const external_id = randomUUID();
 
   const response = await fetch('https://api.mux.com/video/v1/uploads', {
@@ -89,13 +96,15 @@ async function uploadToMux({ fileData, mimetype, originalFilename }) {
   const upload_url = json.data.url;
   const upload_id = json.data.id;
 
+  const fileStream = fsSync.createReadStream(filepath);
+
   const uploadResp = await fetch(upload_url, {
     method: 'PUT',
     headers: {
       'Content-Type': mimetype || 'application/octet-stream',
       'Origin': '*'
     },
-    body: fileData
+    body: fileStream
   });
   if (!uploadResp.ok) {
     const text = await uploadResp.text();
@@ -116,7 +125,7 @@ const app = express();
 // --- Generic CORS for all API endpoints
 app.use(cors({ origin: '*', credentials: false }));
 
-// --- Body parser (for session/cookies)
+// --- Body parser
 app.use(bodyParser.json({ limit: '50mb' }));
 
 app.use(session({
@@ -124,13 +133,13 @@ app.use(session({
   resave: false,
   saveUninitialized: true,
   cookie: {
-    secure: false,       // must be false unless on HTTPS custom domain!
+    secure: false,
     sameSite: 'lax',
     maxAge: 24 * 60 * 60 * 1000
   }
 }));
 
-// ---- Uppy Companion middleware (cloud providers)
+// ---- Uppy Companion middleware
 const options = {
   providerOptions: {
     drive: {
@@ -161,7 +170,7 @@ app.use(companionApp);
 
 // ---- Your /upload endpoint!
 app.options('/upload', (req, res) => {
-  // CORS options/preflight
+  // CORS preflight
   res.set('Access-Control-Allow-Origin', '*');
   res.set('Access-Control-Allow-Methods', 'GET, OPTIONS, POST');
   res.set('Access-Control-Allow-Headers', 'Content-Type');
@@ -172,11 +181,14 @@ app.post('/upload', (req, res) => {
   const form = new formidable.IncomingForm({ 
     multiples: false, 
     uploadDir: UPLOAD_DIR, 
-    keepExtensions: true 
+    keepExtensions: true,
+    maxFileSize: 2 * 1024 * 1024 * 1024 // 2GB, adjust as needed!
   });
+
   form.parse(req, async (err, fields, files) => {
     if (err) {
-      res.status(500).json({error: err.message});
+      console.error('Formidable error:', err);
+      res.status(500).json({ error: 'Formidable error: ' + err.message });
       return;
     }
     try {
@@ -184,17 +196,17 @@ app.post('/upload', (req, res) => {
       const { filepath, originalFilename, mimetype, size } = uploaded;
       const timestamp = Date.now();
       const safeName = originalFilename.replace(/[^\w.\-]/g, '_');
-      const fileData = await fs.readFile(filepath);
 
       let result = {};
       if (isVideoOrAudio(mimetype)) {
-        result = await uploadToMux({ fileData, mimetype, originalFilename });
+        result = await uploadToMux({ filepath, mimetype, originalFilename });
       } else {
         const wasabiKey = `${timestamp}_${safeName}`;
-        const url = await uploadToWasabi({ fileData, wasabiKey, mimetype });
+        const url = await uploadToWasabi({ filepath, wasabiKey, mimetype });
         result = { wasabi_url: url };
       }
 
+      // Clean up local temp file after upload
       await fs.unlink(filepath).catch(() => {});
 
       res.status(200).json({
@@ -205,6 +217,7 @@ app.post('/upload', (req, res) => {
         ...result
       });
     } catch (e) {
+      console.error('Upload error:', e);
       res.status(500).json({ error: e.message });
     }
   });
@@ -215,11 +228,11 @@ app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });
 });
 
-// ---- Start up, enable ws
+// ---- Start server
 const PORT = process.env.PORT || 3020;
 const server = app.listen(PORT, () => {
   console.log(`✅ Server running at port ${PORT}`);
 });
 
-// ---- WebSockets for Companion events (must pass the http.Server instance)
+// ---- WebSockets for Companion events
 companion.socket(server, options);
