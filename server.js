@@ -208,7 +208,9 @@ app.post('/upload', (req, res) => {
   form.parse(req, async (err, fields, files) => {
     if (err) {
       console.error('Formidable error:', err);
-      res.status(500).json({ error: 'Formidable error: ' + err.message });
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Formidable error: ' + err.message });
+      }
       return;
     }
     try {
