@@ -185,6 +185,26 @@ app.post('/upload', (req, res) => {
     maxFileSize: 2 * 1024 * 1024 * 1024 // 2GB, adjust as needed!
   });
 
+  req.on('aborted', () => {
+    console.warn('⚠️ Request aborted by the client.');
+    form.emit('error', new Error('Client aborted the request.'));
+  });
+
+  // Logs For Debugging
+  
+  form.on('fileBegin', (name, file) => {
+    console.log(`Upload started: ${file.originalFilename}`);
+  });
+  form.on('file', (name, file) => {
+    console.log(`File uploaded: ${file.originalFilename}`);
+  });
+  form.on('end', () => {
+    console.log('Formidable parse complete');
+  });
+  form.on('error', err => {
+    console.error('Formidable internal error:', err);
+  });
+
   form.parse(req, async (err, fields, files) => {
     if (err) {
       console.error('Formidable error:', err);
