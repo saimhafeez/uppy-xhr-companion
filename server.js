@@ -256,7 +256,7 @@ const CONFIG_GOOGLE_CALENDAR = {
   JWT_SECRET: process.env.COMPANION_SECRET,
   TOKEN_EXPIRY: '5m',
   COOKIE_NAME: 'google_auth_state',
-  COMPANION_DOMAIN: process.env.COMPANION_DOMAIN,
+  COMPANION_DOMAIN: `https://${process.env.COMPANION_DOMAIN}`,
   ALLOWED_REDIRECT_PATHS: ['/'],
 };
 
