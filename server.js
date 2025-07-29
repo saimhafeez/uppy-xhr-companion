@@ -10,6 +10,10 @@ const fetch = require('node-fetch');
 const { randomUUID } = require('crypto');
 const path = require('path');
 const cors = require('cors');
+// Google Calendar
+const { google } = require('googleapis');
+const jwt = require('jsonwebtoken');
+const cookieParser = require('cookie-parser');
 
 // AWS SDK v3
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
@@ -240,6 +244,216 @@ app.post('/upload', (req, res) => {
     }
   });
 });
+
+///////////////////////////////////////////////////
+///////////    Google Calendar    /////////////////
+///////////////////////////////////////////////////
+
+// ==== CONFIGURATION ====
+
+const CONFIG_GOOGLE_CALENDAR = {
+  CLIENT_ID: process.env.GOOGLE_CALENDAR_CLIENT_ID,
+  CLIENT_SECRET: process.env.GOOGLE_CALENDAR_CLIENT_SECRET,
+  JWT_SECRET: process.env.COMPANION_SECRET,
+  TOKEN_EXPIRY: '5m',
+  COOKIE_NAME: 'google_auth_state',
+  COMPANION_DOMAIN: process.env.COMPANION_DOMAIN,
+  ALLOWED_REDIRECT_PATHS: ['/'],
+};
+
+// ==== GOOGLE OAUTH2 CLIENT ====
+const oauth2Client = new google.auth.OAuth2(
+  CONFIG_GOOGLE_CALENDAR.CLIENT_ID,
+  CONFIG_GOOGLE_CALENDAR.CLIENT_SECRET,
+  `${CONFIG_GOOGLE_CALENDAR.COMPANION_DOMAIN}/login/google/callback`
+);
+google.options({ auth: oauth2Client });
+
+// ==== UTILITY FUNCTIONS ====
+function generateStateToken(origin) {
+  return jwt.sign({ origin }, CONFIG_GOOGLE_CALENDAR.JWT_SECRET, { expiresIn: CONFIG_GOOGLE_CALENDAR.TOKEN_EXPIRY });
+}
+
+function verifyStateToken(token) {
+  try {
+    const decoded = jwt.verify(token, CONFIG_GOOGLE_CALENDAR.JWT_SECRET);
+    return decoded.origin;
+  } catch (err) {
+    return null;
+  }
+}
+
+// ==== LOGIN: GOOGLE CALENDAR WITH REFRESH TOKEN ====
+app.get('/login/google/calendar', (req, res) => {
+  const { origin } = req.query;
+  if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
+
+  const stateToken = generateStateToken(origin);
+  res.cookie(CONFIG_GOOGLE_CALENDAR.COOKIE_NAME, stateToken, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'none',
+    maxAge: 300000, // 5 min
+  });
+
+  const url = oauth2Client.generateAuthUrl({
+    access_type: 'offline',
+    prompt: 'consent', // Always prompt for consent to force refresh_token
+    include_granted_scopes: true,
+    scope: [
+      'https://www.googleapis.com/auth/userinfo.email',
+      'https://www.googleapis.com/auth/userinfo.profile',
+      'https://www.googleapis.com/auth/calendar',
+    ],
+  });
+  res.redirect(url);
+});
+
+// ==== GOOGLE OAUTH2 CALLBACK ====
+app.get('/login/google/callback', async (req, res) => {
+  const { code } = req.query;
+  const stateToken = req.cookies[CONFIG_GOOGLE_CALENDAR.COOKIE_NAME];
+  if (!stateToken) return res.status(400).send('Missing state token');
+  const origin = verifyStateToken(stateToken);
+  if (!origin) return res.status(400).send('Invalid state token');
+  res.clearCookie(CONFIG_GOOGLE_CALENDAR.COOKIE_NAME);
+
+  try {
+    const { tokens } = await oauth2Client.getToken(code);
+    oauth2Client.setCredentials(tokens);
+
+    // User info
+    const oauth2 = google.oauth2({ version: 'v2', auth: oauth2Client });
+    const { data } = await oauth2.userinfo.get();
+
+    const refresh_token = tokens.refresh_token || null;
+    const refresh_token_expires_in = tokens.expiry_date
+      ? Math.floor((tokens.expiry_date - Date.now()) / 1000)
+      : null;
+
+    const infoForJwt = {
+      refresh_token,
+      refresh_token_expires_in,
+      email: data.email,
+      name: data.name,
+      picture: data.picture,
+    };
+
+    const loginToken = jwt.sign(infoForJwt, CONFIG_GOOGLE_CALENDAR.JWT_SECRET, { expiresIn: '2m' });
+
+    // If 'refresh_token' present, send as calendar source, else regular login
+    const isCalendar = refresh_token !== null;
+    const postMessageSource = isCalendar ? 'companion-google-calendar' : 'companion-google-login';
+    const storageTokenKey = isCalendar ? 'googleCalendarRefreshToken' : 'googleAuthToken';
+    const storageOriginKey = isCalendar ? 'googleCalendarAuthOrigin' : 'googleAuthOrigin';
+
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Google Authentication</title>
+        <script>
+          (function() {
+            const token = '${loginToken}';
+            const targetOrigin = '${origin}';
+            const source = '${postMessageSource}';
+
+            // Try immediate postMessage to popup opener
+            if (window.opener && !window.opener.closed) {
+              window.opener.postMessage({
+                source: source,
+                loginToken: token,
+                status: 'success'
+              }, targetOrigin);
+
+              // Fallback: store in localStorage
+              localStorage.setItem('${storageTokenKey}', token);
+              localStorage.setItem('${storageOriginKey}', targetOrigin);
+
+              setTimeout(() => window.close(), 100);
+            } else {
+              document.getElementById('auto-close').style.display = 'none';
+              document.getElementById('manual-close').style.display = 'block';
+            }
+
+            window.addEventListener('beforeunload', function() {
+              if (window.opener && !window.opener.closed) {
+                window.opener.postMessage({
+                  source: source, loginToken: token, status: 'success'
+                }, targetOrigin);
+              }
+            });
+          })();
+        </script>
+        <style>
+          body { font-family: Arial, sans-serif; text-align: center; padding: 40px; }
+          #manual-close { display: none; margin-top: 20px; }
+          button { padding: 10px 20px; background: #4285F4; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        </style>
+      </head>
+      <body>
+        <p id="auto-close">Authentication complete. Closing window...</p>
+        <div id="manual-close">
+          <p>Authentication complete. You may now close this window.</p>
+          <button onclick="window.close()">Close Window</button>
+        </div>
+      </body>
+      </html>
+    `);
+  } catch (error) {
+    const safeMsg = ('' + error.message).replace(/'/g, "\\'");
+    console.error("OAuth2 callback error:", error); // log for debugging
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Authentication Error</title>
+        <script>
+          window.opener && window.opener.postMessage({
+            source: 'companion-google-calendar',
+            status: 'error',
+            error: '${safeMsg}'
+          }, '${origin}');
+          window.close();
+        </script>
+      </head>
+      <body>
+        <p>Authentication failed. Closing window...</p>
+      </body>
+      </html>
+    `);
+  }
+});
+
+// ==== CALENDAR TOKEN VERIFY ENDPOINT ====
+app.get('/login/tokeninfo/calendar', (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ failed: true, error: 'Token is required' });
+
+  try {
+    const decoded = jwt.verify(token, CONFIG_GOOGLE_CALENDAR.JWT_SECRET);
+    if (!decoded.refresh_token) {
+      return res.status(401).json({ failed: true, error: 'No refresh_token present. Did user consent?' });
+    }
+    res.json({
+      refresh_token: decoded.refresh_token,
+      refresh_token_expires_in: decoded.refresh_token_expires_in,
+      email: decoded.email,
+      name: decoded.name,
+      picture: decoded.picture,
+      failed: false
+    });
+  } catch (err) {
+    console.error("Tokeninfo/calendar error:", err);
+    res.status(401).json({ failed: true, error: 'Invalid or expired token' });
+  }
+});
+
+
+
+///////////////////////////////////////////////////
+///////////         Server        /////////////////
+///////////////////////////////////////////////////
 
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });
