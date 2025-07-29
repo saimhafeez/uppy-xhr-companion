@@ -13,7 +13,6 @@ const cors = require('cors');
 // Google Calendar
 const { google } = require('googleapis');
 const jwt = require('jsonwebtoken');
-const cookieParser = require('cookie-parser');
 
 // AWS SDK v3
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');

@@ -17,6 +17,8 @@
     "express-session": "^1.17.3",
     "formidable": "^3.5.0",
     "fs-extra": "^11.2.0",
-    "node-fetch": "^2.6.7"
+    "node-fetch": "^2.6.7",
+    "googleapis": "^130.0.0",
+    "jsonwebtoken": "^9.0.2"
   }
 }
