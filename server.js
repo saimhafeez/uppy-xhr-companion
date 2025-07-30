@@ -453,9 +453,7 @@ app.get('/login/tokeninfo/calendar', (req, res) => {
 ///////////    Outlook Calendar    ////////////////
 ///////////////////////////////////////////////////
 
-const { Issuer, generators } = require('openid-client');
-//const cookie = require('cookie');
-const simpleOauth2 = require('simple-oauth2'); // For MS OAuth2
+const { AuthorizationCode } = require('simple-oauth2'); // USE THIS, not .create!
 
 const CONFIG_OUTLOOK_CALENDAR = {
   CLIENT_ID: process.env.OUTLOOK_CALENDAR_CLIENT_ID,
@@ -465,7 +463,6 @@ const CONFIG_OUTLOOK_CALENDAR = {
   TOKEN_EXPIRY: '5m',
   COOKIE_NAME: 'outlook_auth_state',
   COMPANION_DOMAIN: `https://${process.env.COMPANION_DOMAIN}`,
-  ALLOWED_REDIRECT_PATHS: ['/'],
   AUTHORITY: 'https://login.microsoftonline.com/common',
   SCOPE: [
     'openid',
@@ -476,7 +473,7 @@ const CONFIG_OUTLOOK_CALENDAR = {
   ],
 };
 
-const outlookOauth2 = simpleOauth2.create({
+const outlookOauth2 = new AuthorizationCode({
   client: {
     id: CONFIG_OUTLOOK_CALENDAR.CLIENT_ID,
     secret: CONFIG_OUTLOOK_CALENDAR.CLIENT_SECRET
@@ -487,6 +484,7 @@ const outlookOauth2 = simpleOauth2.create({
     tokenPath: '/oauth2/v2.0/token',
   }
 });
+
 function generateOutlookStateToken(origin) {
   return jwt.sign({ origin }, CONFIG_OUTLOOK_CALENDAR.JWT_SECRET, { expiresIn: CONFIG_OUTLOOK_CALENDAR.TOKEN_EXPIRY });
 }
@@ -498,9 +496,11 @@ function verifyOutlookStateToken(token) {
     return null;
   }
 }
+
 app.get('/login/outlook/calendar', (req, res) => {
   const { origin } = req.query;
   if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
+
   const stateToken = generateOutlookStateToken(origin);
   res.cookie(CONFIG_OUTLOOK_CALENDAR.COOKIE_NAME, stateToken, {
     httpOnly: true,
@@ -508,7 +508,8 @@ app.get('/login/outlook/calendar', (req, res) => {
     sameSite: 'none',
     maxAge: 300000, // 5 min
   });
-  const authorizationUri = outlookOauth2.authorizationCode.authorizeURL({
+
+  const authorizationUri = outlookOauth2.authorizeURL({
     redirect_uri: CONFIG_OUTLOOK_CALENDAR.REDIRECT_URI,
     scope: CONFIG_OUTLOOK_CALENDAR.SCOPE.join(' '),
     response_type: 'code',
@@ -516,6 +517,7 @@ app.get('/login/outlook/calendar', (req, res) => {
   });
   res.redirect(authorizationUri);
 });
+
 app.get('/login/outlook/callback', async (req, res) => {
   const { code, error, error_description } = req.query;
   const stateToken = req.cookies[CONFIG_OUTLOOK_CALENDAR.COOKIE_NAME];
@@ -523,6 +525,7 @@ app.get('/login/outlook/callback', async (req, res) => {
   const origin = verifyOutlookStateToken(stateToken);
   if (!origin) return res.status(400).send('Invalid state token');
   res.clearCookie(CONFIG_OUTLOOK_CALENDAR.COOKIE_NAME);
+
   if (error) {
     const safeMsg = (error_description || error).replace(/'/g, "\\'");
     return res.send(`
@@ -545,20 +548,26 @@ app.get('/login/outlook/callback', async (req, res) => {
       </html>
     `);
   }
+
   try {
-    const result = await outlookOauth2.authorizationCode.getToken({
+    // Exchange code for token
+    const result = await outlookOauth2.getToken({
       code,
       redirect_uri: CONFIG_OUTLOOK_CALENDAR.REDIRECT_URI,
       scope: CONFIG_OUTLOOK_CALENDAR.SCOPE.join(' ')
     });
-    const refresh_token = result.refresh_token || null;
-    const refresh_token_expires_in = result.expires_in ? `${result.expires_in}` : null;
+    const token = result.token; // <-- simple-oauth2 v4+ puts data in .token
+
+    const refresh_token = token.refresh_token || null;
+    const refresh_token_expires_in = token.expires_in ? `${token.expires_in}` : null;
+
+    // Fetch user info from Microsoft Graph
     let email = null, name = null, picture = null;
-    if (result.access_token) {
+    if (token.access_token) {
       try {
         const userResp = await fetch('https://graph.microsoft.com/v1.0/me', {
           method: 'GET',
-          headers: { Authorization: 'Bearer ' + result.access_token }
+          headers: { Authorization: 'Bearer ' + token.access_token }
         });
         if (userResp.ok) {
           const user = await userResp.json();
@@ -566,7 +575,7 @@ app.get('/login/outlook/callback', async (req, res) => {
           name = user.displayName || null;
           try {
             const picResp = await fetch('https://graph.microsoft.com/v1.0/me/photo/$value', {
-              headers: { Authorization: 'Bearer ' + result.access_token }
+              headers: { Authorization: 'Bearer ' + token.access_token }
             });
             if (picResp.ok) {
               const picBuf = await picResp.arrayBuffer();
@@ -577,12 +586,15 @@ app.get('/login/outlook/callback', async (req, res) => {
         }
       } catch(e) {}
     }
+
     const infoForJwt = {
       refresh_token,
       refresh_token_expires_in,
       email, name, picture,
     };
+
     const loginToken = jwt.sign(infoForJwt, CONFIG_OUTLOOK_CALENDAR.JWT_SECRET, { expiresIn: '2m' });
+
     res.send(`
       <!DOCTYPE html>
       <html>
@@ -630,53 +642,53 @@ app.get('/login/outlook/callback', async (req, res) => {
       </body>
       </html>
     `);
-  }     catch (err) {
-        const safeMsg = ('' + err.message).replace(/'/g, "\\'");
-        console.error("Outlook oauth2 callback error:", err);
-        res.send(`
-          <!DOCTYPE html>
-          <html>
-          <head>
-            <title>Authentication Error</title>
-            <script>
-              window.opener && window.opener.postMessage({
-                source: 'companion-outlook-calendar',
-                status: 'error',
-                error: '${safeMsg}'
-              }, '${origin}');
-              window.close();
-            </script>
-          </head>
-          <body>
-            <p>Authentication failed. Closing window...</p>
-          </body>
-          </html>
-        `);
-    }
+  } catch (err) {
+    const safeMsg = ('' + err.message).replace(/'/g, "\\'");
+    console.error("Outlook oauth2 callback error:", err);
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Authentication Error</title>
+        <script>
+          window.opener && window.opener.postMessage({
+            source: 'companion-outlook-calendar',
+            status: 'error',
+            error: '${safeMsg}'
+          }, '${origin}');
+          window.close();
+        </script>
+      </head>
+      <body>
+        <p>Authentication failed. Closing window...</p>
+      </body>
+      </html>
+    `);
+  }
 });
 
 // ==== CALENDAR TOKEN VERIFY ENDPOINT ====
 app.get('/login/tokeninfo/outlook', (req, res) => {
-    const { token } = req.query;
-    if (!token) return res.status(400).json({ failed: true, error: 'Token is required' });
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ failed: true, error: 'Token is required' });
 
-    try {
-        const decoded = jwt.verify(token, CONFIG_OUTLOOK_CALENDAR.JWT_SECRET);
-        if (!decoded.refresh_token) {
-            return res.status(401).json({ failed: true, error: 'No refresh_token present. Did user consent?' });
-        }
-        res.json({
-            refresh_token: decoded.refresh_token,
-            refresh_token_expires_in: decoded.refresh_token_expires_in,
-            email: decoded.email,
-            name: decoded.name,
-            picture: decoded.picture,
-            failed: false
-        });
-    } catch (err) {
-        console.error("Tokeninfo/outlook error:", err);
-        res.status(401).json({ failed: true, error: 'Invalid or expired token' });
+  try {
+    const decoded = jwt.verify(token, CONFIG_OUTLOOK_CALENDAR.JWT_SECRET);
+    if (!decoded.refresh_token) {
+      return res.status(401).json({ failed: true, error: 'No refresh_token present. Did user consent?' });
     }
+    res.json({
+      refresh_token: decoded.refresh_token,
+      refresh_token_expires_in: decoded.refresh_token_expires_in,
+      email: decoded.email,
+      name: decoded.name,
+      picture: decoded.picture,
+      failed: false
+    });
+  } catch (err) {
+    console.error("Tokeninfo/outlook error:", err);
+    res.status(401).json({ failed: true, error: 'Invalid or expired token' });
+  }
 });
 
 
