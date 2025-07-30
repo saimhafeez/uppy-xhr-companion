@@ -510,12 +510,12 @@ app.get('/login/outlook/calendar', (req, res) => {
   });
 
   const authorizationUri = outlookOauth2.authorizeURL({
-    tenant: 'common',
     redirect_uri: CONFIG_OUTLOOK_CALENDAR.REDIRECT_URI,
     scope: CONFIG_OUTLOOK_CALENDAR.SCOPE.join(' '),
     response_type: 'code',
     prompt: 'consent',
   });
+  console.log("MS Authorize URI:", authorizationUri);
   res.redirect(authorizationUri);
 });
 
