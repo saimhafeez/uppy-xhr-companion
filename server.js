@@ -553,12 +553,42 @@ app.get('/login/outlook/callback', async (req, res) => {
 
   try {
     // Exchange code for token
-    const result = await outlookOauth2.getToken({
-      code,
+    const formdata = new URLSearchParams({
+      client_id: CONFIG_OUTLOOK_CALENDAR.CLIENT_ID,
+      client_secret: CONFIG_OUTLOOK_CALENDAR.CLIENT_SECRET,
+      scope: CONFIG_OUTLOOK_CALENDAR.SCOPE.join(' '),
+      code: code,
       redirect_uri: CONFIG_OUTLOOK_CALENDAR.REDIRECT_URI,
-      scope: CONFIG_OUTLOOK_CALENDAR.SCOPE.join(' ')
+      grant_type: 'authorization_code'
     });
-    const token = result.token; // <-- simple-oauth2 v4+ puts data in .token
+
+    const tokenEndpoint = 'https://login.microsoftonline.com/common/oauth2/v2.0/token';
+    const fetchResp = await fetch(tokenEndpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: formdata.toString()
+    });
+
+    // For raw debug:
+    const rawBody = await fetchResp.text();
+    console.log("MS token endpoint raw response:", rawBody);
+
+    let tokenObj = null;
+    try {
+      tokenObj = JSON.parse(rawBody);
+    } catch (e) {
+      // Microsoft error: not JSON
+      throw new Error("Token response was not JSON: " + rawBody.slice(0, 200));
+    }
+
+    if (tokenObj.error) {
+      throw new Error(`Token error: ${tokenObj.error} - ${tokenObj.error_description || ''}`);
+    }
+
+    // Now you have `tokenObj` as the parsed token JSON:
+    const token = tokenObj;
 
     const refresh_token = token.refresh_token || null;
     const refresh_token_expires_in = token.expires_in ? `${token.expires_in}` : null;
