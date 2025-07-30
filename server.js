@@ -509,12 +509,13 @@ app.get('/login/outlook/calendar', (req, res) => {
     maxAge: 300000, // 5 min
   });
 
-  const authorizationUri = outlookOauth2.authorizeURL({
-    redirect_uri: CONFIG_OUTLOOK_CALENDAR.REDIRECT_URI,
-    scope: CONFIG_OUTLOOK_CALENDAR.SCOPE.join(' '),
-    response_type: 'code',
-    prompt: 'consent',
-  });
+  const authorizationUri = `https://login.microsoftonline.com/common/oauth2/v2.0/authorize?`+
+    `response_type=code` +
+    `&client_id=${encodeURIComponent(CONFIG_OUTLOOK_CALENDAR.CLIENT_ID)}` +
+    `&redirect_uri=${encodeURIComponent(CONFIG_OUTLOOK_CALENDAR.REDIRECT_URI)}` +
+    `&scope=${encodeURIComponent(CONFIG_OUTLOOK_CALENDAR.SCOPE.join(' '))}` +
+    `&prompt=consent`;
+    
   console.log("MS Authorize URI:", authorizationUri);
   res.redirect(authorizationUri);
 });
