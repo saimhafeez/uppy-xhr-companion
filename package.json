@@ -19,6 +19,7 @@
     "fs-extra": "^11.2.0",
     "node-fetch": "^2.6.7",
     "googleapis": "^130.0.0",
-    "jsonwebtoken": "^9.0.2"
+    "jsonwebtoken": "^9.0.2",
+    "simple-oauth2": "^5.1.0"
   }
 }

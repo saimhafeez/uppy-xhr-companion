@@ -449,6 +449,237 @@ app.get('/login/tokeninfo/calendar', (req, res) => {
 });
 
 
+///////////////////////////////////////////////////
+///////////    Outlook Calendar    ////////////////
+///////////////////////////////////////////////////
+
+const { Issuer, generators } = require('openid-client');
+//const cookie = require('cookie');
+const simpleOauth2 = require('simple-oauth2'); // For MS OAuth2
+
+const CONFIG_OUTLOOK_CALENDAR = {
+  CLIENT_ID: process.env.OUTLOOK_CALENDAR_CLIENT_ID,
+  CLIENT_SECRET: process.env.OUTLOOK_CALENDAR_CLIENT_SECRET,
+  REDIRECT_URI: `https://${process.env.COMPANION_DOMAIN}/login/outlook/callback`,
+  JWT_SECRET: process.env.COMPANION_SECRET,
+  TOKEN_EXPIRY: '5m',
+  COOKIE_NAME: 'outlook_auth_state',
+  COMPANION_DOMAIN: `https://${process.env.COMPANION_DOMAIN}`,
+  ALLOWED_REDIRECT_PATHS: ['/'],
+  AUTHORITY: 'https://login.microsoftonline.com/common',
+  SCOPE: [
+    'openid',
+    'offline_access',
+    'profile',
+    'email',
+    'https://graph.microsoft.com/Calendars.ReadWrite'
+  ],
+};
+
+const outlookOauth2 = simpleOauth2.create({
+  client: {
+    id: CONFIG_OUTLOOK_CALENDAR.CLIENT_ID,
+    secret: CONFIG_OUTLOOK_CALENDAR.CLIENT_SECRET
+  },
+  auth: {
+    tokenHost: CONFIG_OUTLOOK_CALENDAR.AUTHORITY,
+    authorizePath: '/oauth2/v2.0/authorize',
+    tokenPath: '/oauth2/v2.0/token',
+  }
+});
+function generateOutlookStateToken(origin) {
+  return jwt.sign({ origin }, CONFIG_OUTLOOK_CALENDAR.JWT_SECRET, { expiresIn: CONFIG_OUTLOOK_CALENDAR.TOKEN_EXPIRY });
+}
+function verifyOutlookStateToken(token) {
+  try {
+    const decoded = jwt.verify(token, CONFIG_OUTLOOK_CALENDAR.JWT_SECRET);
+    return decoded.origin;
+  } catch (err) {
+    return null;
+  }
+}
+app.get('/login/outlook/calendar', (req, res) => {
+  const { origin } = req.query;
+  if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
+  const stateToken = generateOutlookStateToken(origin);
+  res.cookie(CONFIG_OUTLOOK_CALENDAR.COOKIE_NAME, stateToken, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'none',
+    maxAge: 300000, // 5 min
+  });
+  const authorizationUri = outlookOauth2.authorizationCode.authorizeURL({
+    redirect_uri: CONFIG_OUTLOOK_CALENDAR.REDIRECT_URI,
+    scope: CONFIG_OUTLOOK_CALENDAR.SCOPE.join(' '),
+    response_type: 'code',
+    prompt: 'consent',
+  });
+  res.redirect(authorizationUri);
+});
+app.get('/login/outlook/callback', async (req, res) => {
+  const { code, error, error_description } = req.query;
+  const stateToken = req.cookies[CONFIG_OUTLOOK_CALENDAR.COOKIE_NAME];
+  if (!stateToken) return res.status(400).send('Missing state token');
+  const origin = verifyOutlookStateToken(stateToken);
+  if (!origin) return res.status(400).send('Invalid state token');
+  res.clearCookie(CONFIG_OUTLOOK_CALENDAR.COOKIE_NAME);
+  if (error) {
+    const safeMsg = (error_description || error).replace(/'/g, "\\'");
+    return res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Authentication Error</title>
+        <script>
+          window.opener && window.opener.postMessage({
+            source: 'companion-outlook-calendar',
+            status: 'error',
+            error: '${safeMsg}'
+          }, '${origin}');
+          window.close();
+        </script>
+      </head>
+      <body>
+        <p>Authentication failed. Closing window...</p>
+      </body>
+      </html>
+    `);
+  }
+  try {
+    const result = await outlookOauth2.authorizationCode.getToken({
+      code,
+      redirect_uri: CONFIG_OUTLOOK_CALENDAR.REDIRECT_URI,
+      scope: CONFIG_OUTLOOK_CALENDAR.SCOPE.join(' ')
+    });
+    const refresh_token = result.refresh_token || null;
+    const refresh_token_expires_in = result.expires_in ? `${result.expires_in}` : null;
+    let email = null, name = null, picture = null;
+    if (result.access_token) {
+      try {
+        const userResp = await fetch('https://graph.microsoft.com/v1.0/me', {
+          method: 'GET',
+          headers: { Authorization: 'Bearer ' + result.access_token }
+        });
+        if (userResp.ok) {
+          const user = await userResp.json();
+          email = user.mail || user.userPrincipalName || null;
+          name = user.displayName || null;
+          try {
+            const picResp = await fetch('https://graph.microsoft.com/v1.0/me/photo/$value', {
+              headers: { Authorization: 'Bearer ' + result.access_token }
+            });
+            if (picResp.ok) {
+              const picBuf = await picResp.arrayBuffer();
+              const base64 = Buffer.from(picBuf).toString('base64');
+              picture = 'data:image/jpeg;base64,' + base64;
+            }
+          } catch(_) {}
+        }
+      } catch(e) {}
+    }
+    const infoForJwt = {
+      refresh_token,
+      refresh_token_expires_in,
+      email, name, picture,
+    };
+    const loginToken = jwt.sign(infoForJwt, CONFIG_OUTLOOK_CALENDAR.JWT_SECRET, { expiresIn: '2m' });
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Outlook Authentication</title>
+        <script>
+          (function() {
+            const token = '${loginToken}';
+            const targetOrigin = '${origin}';
+            const source = 'companion-outlook-calendar';
+            if (window.opener && !window.opener.closed) {
+              window.opener.postMessage({
+                source: source,
+                loginToken: token,
+                status: 'success'
+              }, targetOrigin);
+              localStorage.setItem('outlookCalendarRefreshToken', token);
+              localStorage.setItem('outlookCalendarAuthOrigin', targetOrigin);
+              setTimeout(() => window.close(), 100);
+            } else {
+              document.getElementById('auto-close').style.display = 'none';
+              document.getElementById('manual-close').style.display = 'block';
+            }
+            window.addEventListener('beforeunload', function() {
+              if (window.opener && !window.opener.closed) {
+                window.opener.postMessage({
+                  source: source, loginToken: token, status: 'success'
+                }, targetOrigin);
+              }
+            });
+          })();
+        </script>
+        <style>
+          body { font-family: Arial, sans-serif; text-align: center; padding: 40px; }
+          #manual-close { display: none; margin-top: 20px; }
+          button { padding: 10px 20px; background: #4267B2; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        </style>
+      </head>
+      <body>
+        <p id="auto-close">Authentication complete. Closing window...</p>
+        <div id="manual-close">
+          <p>Authentication complete. You may now close this window.</p>
+          <button onclick="window.close()">Close Window</button>
+        </div>
+      </body>
+      </html>
+    `);
+  }     catch (err) {
+        const safeMsg = ('' + err.message).replace(/'/g, "\\'");
+        console.error("Outlook oauth2 callback error:", err);
+        res.send(`
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <title>Authentication Error</title>
+            <script>
+              window.opener && window.opener.postMessage({
+                source: 'companion-outlook-calendar',
+                status: 'error',
+                error: '${safeMsg}'
+              }, '${origin}');
+              window.close();
+            </script>
+          </head>
+          <body>
+            <p>Authentication failed. Closing window...</p>
+          </body>
+          </html>
+        `);
+    }
+});
+
+// ==== CALENDAR TOKEN VERIFY ENDPOINT ====
+app.get('/login/tokeninfo/outlook', (req, res) => {
+    const { token } = req.query;
+    if (!token) return res.status(400).json({ failed: true, error: 'Token is required' });
+
+    try {
+        const decoded = jwt.verify(token, CONFIG_OUTLOOK_CALENDAR.JWT_SECRET);
+        if (!decoded.refresh_token) {
+            return res.status(401).json({ failed: true, error: 'No refresh_token present. Did user consent?' });
+        }
+        res.json({
+            refresh_token: decoded.refresh_token,
+            refresh_token_expires_in: decoded.refresh_token_expires_in,
+            email: decoded.email,
+            name: decoded.name,
+            picture: decoded.picture,
+            failed: false
+        });
+    } catch (err) {
+        console.error("Tokeninfo/outlook error:", err);
+        res.status(401).json({ failed: true, error: 'Invalid or expired token' });
+    }
+});
+
+
 
 ///////////////////////////////////////////////////
 ///////////         Server        /////////////////
