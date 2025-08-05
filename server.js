@@ -969,6 +969,184 @@ app.get('/login/tokeninfo/zoom', (req, res) => {
 });
 
 
+/////////////////////////////////////////////////////
+///////////     Google Analytics   /////////////////
+////////////////////////////////////////////////////
+
+const CONFIG_GOOGLE_ANALYTICS = {
+  CLIENT_ID: process.env.GOOGLE_ANALYTICS_CLIENT_ID,
+  CLIENT_SECRET: process.env.GOOGLE_ANALYTICS_CLIENT_SECRET,
+  JWT_SECRET: process.env.COMPANION_SECRET,
+  TOKEN_EXPIRY: '5m',
+  COOKIE_NAME: 'google_analytics_auth_state',
+  COMPANION_DOMAIN: `https://${process.env.COMPANION_DOMAIN}`,
+  SCOPES: [
+    // Only what's required for Analytics property/datastream management
+    "https://www.googleapis.com/auth/analytics.edit"
+  ]
+};
+
+const analyticsOAuth2Client = new google.auth.OAuth2(
+  CONFIG_GOOGLE_ANALYTICS.CLIENT_ID,
+  CONFIG_GOOGLE_ANALYTICS.CLIENT_SECRET,
+  `${CONFIG_GOOGLE_ANALYTICS.COMPANION_DOMAIN}/login/google-analytics/callback`
+);
+
+function generateAnalyticsStateToken(origin) {
+  return jwt.sign({ origin }, CONFIG_GOOGLE_ANALYTICS.JWT_SECRET, { expiresIn: CONFIG_GOOGLE_ANALYTICS.TOKEN_EXPIRY });
+}
+function verifyAnalyticsStateToken(token) {
+  try {
+    const decoded = jwt.verify(token, CONFIG_GOOGLE_ANALYTICS.JWT_SECRET);
+    return decoded.origin;
+  } catch (e) {
+    return null;
+  }
+}
+
+// === OAUTH2 LOGIN ENDPOINT ===
+app.get('/login/google-analytics', (req, res) => {
+  const { origin } = req.query;
+  if (!origin) return res.status(400).json({ error: "Origin parameter is required" });
+
+  const stateToken = generateAnalyticsStateToken(origin);
+  res.cookie(CONFIG_GOOGLE_ANALYTICS.COOKIE_NAME, stateToken, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'none',
+    maxAge: 5 * 60 * 1000 // 5 minutes
+  });
+
+  const url = analyticsOAuth2Client.generateAuthUrl({
+    access_type: 'offline',
+    prompt: 'consent',
+    include_granted_scopes: false,
+    scope: CONFIG_GOOGLE_ANALYTICS.SCOPES
+  });
+  res.redirect(url);
+});
+
+// === OAUTH2 CALLBACK ===
+app.get('/login/google-analytics/callback', async (req, res) => {
+  const { code } = req.query;
+  const stateToken = req.cookies[CONFIG_GOOGLE_ANALYTICS.COOKIE_NAME];
+  if (!stateToken) return res.status(400).send('Missing state token');
+  const origin = verifyAnalyticsStateToken(stateToken);
+  if (!origin) return res.status(400).send('Invalid state token');
+  res.clearCookie(CONFIG_GOOGLE_ANALYTICS.COOKIE_NAME);
+
+  try {
+    const { tokens } = await analyticsOAuth2Client.getToken(code);
+
+    const refresh_token = tokens.refresh_token || null;
+    const access_token = tokens.access_token || null;
+    const expires_in = tokens.expiry_date
+      ? Math.floor((tokens.expiry_date - Date.now()) / 1000)
+      : null;
+
+    const infoForJwt = {
+      refresh_token,
+      access_token,
+      expires_in
+    };
+
+    const loginToken = jwt.sign(infoForJwt, CONFIG_GOOGLE_ANALYTICS.JWT_SECRET, { expiresIn: '2m' });
+
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Google Analytics Authentication</title>
+        <script>
+          (function() {
+            const token = '${loginToken}';
+            const targetOrigin = '${origin}';
+            const source = 'companion-google-analytics';
+
+            if (window.opener && !window.opener.closed) {
+              window.opener.postMessage({
+                source: source,
+                loginToken: token,
+                status: 'success'
+              }, targetOrigin);
+
+              localStorage.setItem('googleAnalyticsRefreshToken', token);
+              localStorage.setItem('googleAnalyticsAuthOrigin', targetOrigin);
+
+              setTimeout(() => window.close(), 100);
+            } else {
+              document.getElementById('auto-close').style.display = 'none';
+              document.getElementById('manual-close').style.display = 'block';
+            }
+
+            window.addEventListener('beforeunload', function() {
+              if (window.opener && !window.opener.closed) {
+                window.opener.postMessage({ source: source, loginToken: token, status: 'success' }, targetOrigin);
+              }
+            });
+          })();
+        </script>
+        <style>
+          body { font-family: Arial, sans-serif; text-align: center; padding: 40px; }
+          #manual-close { display: none; margin-top: 20px; }
+          button { padding: 10px 20px; background: #4285F4; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        </style>
+      </head>
+      <body>
+        <p id="auto-close">Authentication complete. Closing window...</p>
+        <div id="manual-close">
+          <p>Authentication complete. You may now close this window.</p>
+          <button onclick="window.close()">Close Window</button>
+        </div>
+      </body>
+      </html>
+    `);
+  } catch (error) {
+    const safeMsg = ("" + error.message).replace(/'/g, "\\'");
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Google Analytics Error</title>
+        <script>
+          window.opener && window.opener.postMessage({
+            source: 'companion-google-analytics',
+            status: 'error',
+            error: '${safeMsg}'
+          }, '${origin}');
+          window.close();
+        </script>
+      </head>
+      <body>
+        <p>Authentication failed. Closing window...</p>
+      </body>
+      </html>
+    `);
+  }
+});
+
+// === TOKEN INFO VERIFICATION ENDPOINT ===
+app.get('/login/tokeninfo/analytics', (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ failed: true, error: 'Token is required' });
+
+  try {
+    const decoded = jwt.verify(token, CONFIG_GOOGLE_ANALYTICS.JWT_SECRET);
+    if (!decoded.refresh_token) {
+      return res.status(401).json({ failed: true, error: 'No refresh_token present. Did user consent?' });
+    }
+    res.json({
+      refresh_token: decoded.refresh_token,
+      access_token: decoded.access_token,
+      expires_in: decoded.expires_in,
+      failed: false
+    });
+  } catch (err) {
+    res.status(401).json({ failed: true, error: 'Invalid or expired token' });
+  }
+});
+
+
 
 ///////////////////////////////////////////////////
 ///////////         Server        /////////////////
