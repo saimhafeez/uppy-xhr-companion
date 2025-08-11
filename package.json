@@ -21,6 +21,7 @@
     "googleapis": "^130.0.0",
     "jsonwebtoken": "^9.0.2",
     "openid-client": "^6.6.2",
-    "simple-oauth2": "^5.1.0"
+    "simple-oauth2": "^5.1.0",
+    "ipx": "^0.13.0"
   }
 }
