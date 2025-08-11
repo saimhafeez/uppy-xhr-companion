@@ -13,6 +13,9 @@ const cors = require('cors');
 // Google Calendar
 const { google } = require('googleapis');
 const jwt = require('jsonwebtoken');
+// IPX
+const { createIPX, ipxFSStorage, ipxHttpStorage, createIPXNodeServer } = require('ipx');
+
 
 // AWS SDK v3
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
@@ -1145,6 +1148,18 @@ app.get('/login/tokeninfo/analytics', (req, res) => {
     res.status(401).json({ failed: true, error: 'Invalid or expired token' });
   }
 });
+
+
+
+///////////////////////////////////////////////////
+//////  IPX SERVER FOR IMAGE OPTIMIZATION  ////////
+///////////////////////////////////////////////////
+const ipx = createIPX({
+  // Allow remote images from any domain:
+  httpStorage: ipxHttpStorage()
+  // No storage, no cache!
+});
+app.use('/ipx', createIPXNodeServer(ipx));
 
 
 
