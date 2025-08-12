@@ -1155,9 +1155,14 @@ app.get('/login/tokeninfo/analytics', (req, res) => {
 //////  IPX SERVER FOR IMAGE OPTIMIZATION  ////////
 ///////////////////////////////////////////////////
 const ipx = createIPX({
-  // Allow remote images from any domain:
-  httpStorage: ipxHttpStorage()
-  // No storage, no cache!
+  httpStorage: ipxHttpStorage({
+    domains: [
+      "upward.s3.us-east-2.wasabisys.com",
+      "aa70287ff58ea68c3f5d2d6e98c40119.cdn.bubble.io"
+      // ,"another-allowed-remote-host.com"
+    ]
+    // You can also use a RegExp/string for wildcards if needed, but restrict as much as possible for security!
+  })
 });
 app.use('/ipx', createIPXNodeServer(ipx));
 
