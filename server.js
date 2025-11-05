@@ -1167,6 +1167,183 @@ const ipx = createIPX({
 app.use('/ipx', createIPXNodeServer(ipx));
 
 
+///////////////////////////////////////////////////
+////////////    Google Meet Auth    ///////////////
+///////////////////////////////////////////////////
+
+const CONFIG_GOOGLE_MEET = {
+  CLIENT_ID: process.env.GOOGLE_MEET_CLIENT_ID,
+  CLIENT_SECRET: process.env.GOOGLE_MEET_CLIENT_SECRET,
+  JWT_SECRET: process.env.COMPANION_SECRET,
+  TOKEN_EXPIRY: '5m',
+  COOKIE_NAME: 'google_meet_auth_state',
+  COMPANION_DOMAIN: `https://${process.env.COMPANION_DOMAIN}`
+};
+
+const meetOauth2Client = new google.auth.OAuth2(
+  CONFIG_GOOGLE_MEET.CLIENT_ID,
+  CONFIG_GOOGLE_MEET.CLIENT_SECRET,
+  `${CONFIG_GOOGLE_MEET.COMPANION_DOMAIN}/login/google/meet/callback`
+);
+
+function generateMeetStateToken(origin) {
+  return jwt.sign({ origin }, CONFIG_GOOGLE_MEET.JWT_SECRET, { expiresIn: CONFIG_GOOGLE_MEET.TOKEN_EXPIRY });
+}
+function verifyMeetStateToken(token) {
+  try {
+    const decoded = jwt.verify(token, CONFIG_GOOGLE_MEET.JWT_SECRET);
+    return decoded.origin;
+  } catch (err) {
+    return null;
+  }
+}
+
+app.get('/login/google/meet', (req, res) => {
+  const { origin } = req.query;
+  if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
+
+  const stateToken = generateMeetStateToken(origin);
+  res.cookie(CONFIG_GOOGLE_MEET.COOKIE_NAME, stateToken, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'none',
+    maxAge: 5 * 60 * 1000,
+  });
+
+  const url = meetOauth2Client.generateAuthUrl({
+    access_type: 'offline',
+    prompt: 'consent',
+    scope: [
+      'https://www.googleapis.com/auth/userinfo.email',
+      'https://www.googleapis.com/auth/userinfo.profile',
+      'https://www.googleapis.com/auth/calendar', // Required for Meet management
+    ]
+  });
+  res.redirect(url);
+});
+
+// ==== GOOGLE MEET OAUTH2 CALLBACK ====
+app.get('/login/google/meet/callback', async (req, res) => {
+  const { code } = req.query;
+  const stateToken = req.cookies[CONFIG_GOOGLE_MEET.COOKIE_NAME];
+  if (!stateToken) return res.status(400).send('Missing state token');
+  const origin = verifyMeetStateToken(stateToken);
+  if (!origin) return res.status(400).send('Invalid state token');
+  res.clearCookie(CONFIG_GOOGLE_MEET.COOKIE_NAME);
+
+  try {
+    const { tokens } = await meetOauth2Client.getToken(code);
+    meetOauth2Client.setCredentials(tokens);
+
+    // User info
+    const oauth2 = google.oauth2({ version: 'v2', auth: meetOauth2Client });
+    const { data } = await oauth2.userinfo.get();
+
+    const refresh_token = tokens.refresh_token || null;
+    const refresh_token_expires_in = tokens.expiry_date
+      ? Math.floor((tokens.expiry_date - Date.now()) / 1000)
+      : null;
+
+    const infoForJwt = {
+      refresh_token,
+      refresh_token_expires_in,
+      email: data.email,
+      name: data.name,
+      picture: data.picture,
+    };
+
+    const loginToken = jwt.sign(infoForJwt, CONFIG_GOOGLE_MEET.JWT_SECRET, { expiresIn: '2m' });
+
+    // For localStorage/postMessage keys (keep these unique to Google Meet flow)
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Google Meet Authentication</title>
+        <script>
+          (function() {
+            const token = '${loginToken}';
+            const targetOrigin = '${origin}';
+            const source = 'companion-google-meet';
+            if (window.opener && !window.opener.closed) {
+              window.opener.postMessage({ source, loginToken: token, status: 'success' }, targetOrigin);
+              localStorage.setItem('googleMeetRefreshToken', token);
+              localStorage.setItem('googleMeetAuthOrigin', targetOrigin);
+              setTimeout(() => window.close(), 100);
+            } else {
+              document.getElementById('auto-close').style.display = 'none';
+              document.getElementById('manual-close').style.display = 'block';
+            }
+            window.addEventListener('beforeunload', function() {
+              if (window.opener && !window.opener.closed) {
+                window.opener.postMessage({ source, loginToken: token, status: 'success' }, targetOrigin);
+              }
+            });
+          })();
+        </script>
+        <style>
+          body { font-family: Arial, sans-serif; text-align: center; padding: 40px; }
+          #manual-close { display: none; margin-top: 20px; }
+          button { padding: 10px 20px; background: #4285F4; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        </style>
+      </head>
+      <body>
+        <p id="auto-close">Authentication complete. Closing window...</p>
+        <div id="manual-close">
+          <p>Authentication complete. You may now close this window.</p>
+          <button onclick="window.close()">Close Window</button>
+        </div>
+      </body>
+      </html>
+    `);
+  } catch (error) {
+    const safeMsg = ('' + error.message).replace(/'/g, "\\'");
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Google Meet Error</title>
+        <script>
+          window.opener && window.opener.postMessage({
+            source: 'companion-google-meet',
+            status: 'error',
+            error: '${safeMsg}'
+          }, '${origin}');
+          window.close();
+        </script>
+      </head>
+      <body>
+        <p>Authentication failed. Closing window...</p>
+      </body>
+      </html>
+    `);
+  }
+});
+
+// ==== MEET TOKEN VERIFY ENDPOINT ====
+app.get('/login/tokeninfo/meet', (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ failed: true, error: 'Token is required' });
+
+  try {
+    const decoded = jwt.verify(token, CONFIG_GOOGLE_MEET.JWT_SECRET);
+    if (!decoded.refresh_token) {
+      return res.status(401).json({ failed: true, error: 'No refresh_token present. Did user consent?' });
+    }
+    res.json({
+      refresh_token: decoded.refresh_token,
+      refresh_token_expires_in: decoded.refresh_token_expires_in,
+      email: decoded.email,
+      name: decoded.name,
+      picture: decoded.picture,
+      failed: false
+    });
+  } catch (err) {
+    res.status(401).json({ failed: true, error: 'Invalid or expired token' });
+  }
+});
+
+
 
 ///////////////////////////////////////////////////
 ///////////         Server        /////////////////
