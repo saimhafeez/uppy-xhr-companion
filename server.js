@@ -15,6 +15,7 @@ const { google } = require('googleapis');
 const jwt = require('jsonwebtoken');
 // IPX
 const { createIPX, ipxFSStorage, ipxHttpStorage, createIPXNodeServer } = require('ipx');
+const axios = require('axios');
 
 
 // AWS SDK v3
@@ -1547,8 +1548,6 @@ app.get('/login/tokeninfo/google', (req, res) => {
 ///////////////////////////////////////////////////
 //      Facebook Login OAuth (profile only)      //
 ///////////////////////////////////////////////////
-
-const axios = require('axios');
 
 const CONFIG_FACEBOOK_LOGIN = {
   APP_ID: process.env.FACEBOOK_APP_ID,
