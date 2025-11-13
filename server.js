@@ -1544,6 +1544,195 @@ app.get('/login/tokeninfo/google', (req, res) => {
 });
 
 
+///////////////////////////////////////////////////
+//      Facebook Login OAuth (profile only)      //
+///////////////////////////////////////////////////
+
+const axios = require('axios');
+
+const CONFIG_FACEBOOK_LOGIN = {
+  APP_ID: process.env.FACEBOOK_APP_ID,
+  APP_SECRET: process.env.FACEBOOK_APP_SECRET,
+  JWT_SECRET: process.env.COMPANION_SECRET,
+  TOKEN_EXPIRY: '2m',
+  COOKIE_NAME: 'facebook_login_state',
+  COMPANION_DOMAIN: `https://${process.env.COMPANION_DOMAIN}`
+};
+
+// ==== State Token utils ====
+function generateFbLoginStateToken(origin) {
+  return jwt.sign({ origin }, CONFIG_FACEBOOK_LOGIN.JWT_SECRET, { expiresIn: CONFIG_FACEBOOK_LOGIN.TOKEN_EXPIRY });
+}
+function verifyFbLoginStateToken(token) {
+  try {
+    const decoded = jwt.verify(token, CONFIG_FACEBOOK_LOGIN.JWT_SECRET);
+    return decoded.origin;
+  } catch {
+    return null;
+  }
+}
+
+// ==== FACEBOOK LOGIN START ====
+app.get('/login/facebook/oauth', (req, res) => {
+  const { origin } = req.query;
+  if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
+
+  const stateToken = generateFbLoginStateToken(origin);
+  res.cookie(CONFIG_FACEBOOK_LOGIN.COOKIE_NAME, stateToken, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'none',
+    maxAge: 120000
+  });
+
+  const redirectUri = `${CONFIG_FACEBOOK_LOGIN.COMPANION_DOMAIN}/login/facebook/oauth/callback`;
+  const authUrl = `https://www.facebook.com/v19.0/dialog/oauth?client_id=${encodeURIComponent(CONFIG_FACEBOOK_LOGIN.APP_ID)}`
+    + `&redirect_uri=${encodeURIComponent(redirectUri)}`
+    + `&scope=email,public_profile`
+    + `&response_type=code`
+    + `&state=facebook-login`;
+
+  res.redirect(authUrl);
+});
+
+// ==== FACEBOOK OAUTH CALLBACK ====
+app.get('/login/facebook/oauth/callback', async (req, res) => {
+  const { code } = req.query;
+  const stateToken = req.cookies[CONFIG_FACEBOOK_LOGIN.COOKIE_NAME];
+  if (!stateToken) return res.status(400).send('Missing state token');
+  const origin = verifyFbLoginStateToken(stateToken);
+  if (!origin) return res.status(400).send('Invalid state token');
+  res.clearCookie(CONFIG_FACEBOOK_LOGIN.COOKIE_NAME);
+
+  try {
+    // 1. Exchange code for access_token:
+    const redirectUri = `${CONFIG_FACEBOOK_LOGIN.COMPANION_DOMAIN}/login/facebook/oauth/callback`;
+    const accessResp = await axios.get('https://graph.facebook.com/v19.0/oauth/access_token', {
+      params: {
+        client_id: CONFIG_FACEBOOK_LOGIN.APP_ID,
+        client_secret: CONFIG_FACEBOOK_LOGIN.APP_SECRET,
+        redirect_uri: redirectUri,
+        code
+      }
+    });
+    const access_token = accessResp.data.access_token;
+
+    // 2. Fetch user info
+    const userResp = await axios.get('https://graph.facebook.com/me', {
+      params: {
+        fields: 'id,first_name,last_name,email,picture.type(large)',
+        access_token
+      }
+    });
+    const user = userResp.data;
+
+    const infoForJwt = {
+      first_name: user.first_name || "",
+      last_name: user.last_name || "",
+      email: user.email || "",
+      picture: user.picture?.data?.url || ""
+    };
+
+    const loginToken = jwt.sign(infoForJwt, CONFIG_FACEBOOK_LOGIN.JWT_SECRET, { expiresIn: CONFIG_FACEBOOK_LOGIN.TOKEN_EXPIRY });
+
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Facebook OAuth Login</title>
+        <script>
+          (function() {
+            const token = '${loginToken}';
+            const targetOrigin = '${origin}';
+            const source = 'companion-facebook-login';
+
+            if (window.opener && !window.opener.closed) {
+              window.opener.postMessage({
+                source: source,
+                loginToken: token,
+                status: 'success'
+              }, targetOrigin);
+
+              localStorage.setItem('facebookLoginToken', token);
+              localStorage.setItem('facebookLoginOrigin', targetOrigin);
+
+              setTimeout(() => window.close(), 100);
+            } else {
+              document.getElementById('auto-close').style.display = 'none';
+              document.getElementById('manual-close').style.display = 'block';
+            }
+
+            window.addEventListener('beforeunload', function() {
+              if (window.opener && !window.opener.closed) {
+                window.opener.postMessage({
+                  source: source,
+                  loginToken: token,
+                  status: 'success'
+                }, targetOrigin);
+              }
+            });
+          })();
+        </script>
+        <style>
+          body { font-family: Arial, sans-serif; text-align: center; padding: 40px; }
+          #manual-close { display: none; margin-top: 20px; }
+          button { padding: 10px 20px; background: #1877f3; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        </style>
+      </head>
+      <body>
+        <p id="auto-close">Authentication complete. Closing window...</p>
+        <div id="manual-close">
+          <p>Authentication complete. You may now close this window.</p>
+          <button onclick="window.close()">Close Window</button>
+        </div>
+      </body>
+      </html>
+    `);
+  } catch (error) {
+    const safeMsg = ('' + error.message).replace(/'/g, "\\'");
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Authentication Error</title>
+        <script>
+          window.opener && window.opener.postMessage({
+            source: 'companion-facebook-login',
+            status: 'error',
+            error: '${safeMsg}'
+          }, '${origin}');
+          window.close();
+        </script>
+      </head>
+      <body>
+        <p>Authentication failed. Closing window...</p>
+      </body>
+      </html>
+    `);
+  }
+});
+
+// ==== TOKEN INFO ENDPOINT FOR /login/facebook/oauth TOKENS ====
+app.get('/login/tokeninfo/facebook', (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ failed: true, error: 'Token is required' });
+
+  try {
+    const decoded = jwt.verify(token, CONFIG_FACEBOOK_LOGIN.JWT_SECRET);
+
+    res.json({
+      first_name: decoded.first_name,
+      last_name: decoded.last_name,
+      email: decoded.email,
+      picture: decoded.picture,
+      failed: false
+    });
+  } catch (err) {
+    res.status(401).json({ failed: true, error: 'Invalid or expired token' });
+  }
+});
+
+
 
 ///////////////////////////////////////////////////
 ///////////         Server        /////////////////
