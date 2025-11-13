@@ -1732,6 +1732,147 @@ app.get('/login/tokeninfo/facebook', (req, res) => {
 });
 
 
+///////////////////////////////////////////////////
+///   Apple Login OAuth (one-time profile only)  ///
+///////////////////////////////////////////////////
+
+// Config (set your Service ID and Companion domain)
+const APPLE_CLIENT_ID = process.env.APPLE_CLIENT_ID;  // Your Service ID (ex: com.example.web)
+const APPLE_REDIRECT_URI = `https://${process.env.COMPANION_DOMAIN}/login/apple/callback`;
+const APPLE_JWT_SECRET = process.env.COMPANION_SECRET; // Use your app's JWT secret
+const APPLE_COOKIE_NAME = 'apple_login_state';
+
+// STATE HANDLING
+const TOKEN_EXPIRY = '2m';
+function generateAppleState(origin) {
+  return jwt.sign({ origin }, APPLE_JWT_SECRET, { expiresIn: TOKEN_EXPIRY });
+}
+function verifyAppleState(token) {
+  try {
+    const decoded = jwt.verify(token, APPLE_JWT_SECRET);
+    return decoded.origin;
+  } catch (e) { return null; }
+}
+
+// 1. Start Apple login
+app.get('/login/apple/oauth', (req, res) => {
+  const { origin } = req.query;
+  if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
+
+  const stateToken = generateAppleState(origin);
+  res.cookie(APPLE_COOKIE_NAME, stateToken, {
+    httpOnly: true, secure: true, sameSite: 'none', maxAge: 120000
+  });
+
+  const params = new URLSearchParams({
+    client_id: APPLE_CLIENT_ID,
+    redirect_uri: APPLE_REDIRECT_URI,
+    response_type: 'code id_token',
+    scope: 'name email',
+    response_mode: 'form_post',
+    state: 'apple-login'
+  });
+  res.redirect(`https://appleid.apple.com/auth/authorize?${params.toString()}`);
+});
+
+// 2. Apple callback (POST)
+app.post('/login/apple/callback', express.urlencoded({ extended: true }), (req, res) => {
+  // Apple will POST: code, id_token, state, user (only first sign-in)
+  const stateToken = req.cookies[APPLE_COOKIE_NAME];
+  if (!stateToken) return res.status(400).send('Missing state token');
+  const origin = verifyAppleState(stateToken);
+  if (!origin) return res.status(400).send('Invalid state token');
+  res.clearCookie(APPLE_COOKIE_NAME);
+
+  // Extract user info
+  let first_name = "", last_name = "", email = "", picture = null;
+  if (req.body.user) {
+    try {
+      const userObj = JSON.parse(req.body.user);
+      first_name = userObj.name ? userObj.name.firstName : "";
+      last_name = userObj.name ? userObj.name.lastName : "";
+      email = userObj.email || "";
+    } catch (e) {}
+  }
+  // If not present, fallback: email from id_token
+  if (!email && req.body.id_token) {
+    try {
+      const decoded = JSON.parse(Buffer.from(req.body.id_token.split('.')[1], 'base64').toString());
+      email = decoded.email || "";
+    } catch (e) {}
+  }
+
+  const infoForJwt = {
+    first_name,
+    last_name,
+    email,
+    picture: null
+  };
+  const loginToken = jwt.sign(infoForJwt, APPLE_JWT_SECRET, { expiresIn: TOKEN_EXPIRY });
+
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Apple OAuth Login</title>
+      <script>
+        (function() {
+          const token = '${loginToken}';
+          const targetOrigin = '${origin}';
+          const source = 'companion-apple-login';
+
+          if (window.opener && !window.opener.closed) {
+            window.opener.postMessage({ source, loginToken: token, status: 'success' }, targetOrigin);
+            localStorage.setItem('appleLoginToken', token);
+            localStorage.setItem('appleLoginOrigin', targetOrigin);
+            setTimeout(() => window.close(), 100);
+          } else {
+            document.getElementById('auto-close').style.display = 'none';
+            document.getElementById('manual-close').style.display = 'block';
+          }
+          window.addEventListener('beforeunload', function() {
+            if (window.opener && !window.opener.closed) {
+              window.opener.postMessage({ source, loginToken: token, status: 'success' }, targetOrigin);
+            }
+          });
+        })();
+      </script>
+      <style>
+        body { font-family: Arial, sans-serif; text-align: center; padding: 40px; }
+        #manual-close { display: none; margin-top: 20px; }
+        button { padding: 10px 20px; background: #000000; color: white; border: none; border-radius: 4px; cursor: pointer; }
+      </style>
+    </head>
+    <body>
+      <p id="auto-close">Authentication complete. Closing window...</p>
+      <div id="manual-close">
+        <p>Authentication complete. You may now close this window.</p>
+        <button onclick="window.close()">Close Window</button>
+      </div>
+    </body>
+    </html>
+  `);
+});
+
+// 3. Token verification endpoint
+app.get('/login/tokeninfo/apple', (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ failed: true, error: 'Token is required' });
+  try {
+    const decoded = jwt.verify(token, APPLE_JWT_SECRET);
+    res.json({
+      first_name: decoded.first_name,
+      last_name: decoded.last_name,
+      email: decoded.email,
+      picture: null,
+      failed: false
+    });
+  } catch (err) {
+    res.status(401).json({ failed: true, error: 'Invalid or expired token' });
+  }
+});
+
+
 
 ///////////////////////////////////////////////////
 ///////////         Server        /////////////////
