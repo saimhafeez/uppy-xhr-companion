@@ -1347,6 +1347,205 @@ app.get('/login/tokeninfo/meet', (req, res) => {
 
 
 ///////////////////////////////////////////////////
+//      Google Login OAuth (profile only)        //
+///////////////////////////////////////////////////
+
+// ==== CONFIGURATION ====
+
+const CONFIG_GOOGLE_LOGIN = {
+  CLIENT_ID: process.env.GOOGLE_LOGIN_CLIENT_ID,
+  CLIENT_SECRET: process.env.GOOGLE_LOGIN_CLIENT_SECRET,
+  JWT_SECRET: process.env.COMPANION_SECRET, // or your own separate one
+  TOKEN_EXPIRY: '2m',
+  COOKIE_NAME: 'google_login_state',
+  COMPANION_DOMAIN: `https://${process.env.COMPANION_DOMAIN}`,
+  ALLOWED_REDIRECT_PATHS: ['/'],
+};
+
+// ==== GOOGLE OAUTH2 CLIENT ====
+const loginOauth2Client = new google.auth.OAuth2(
+  CONFIG_GOOGLE_LOGIN.CLIENT_ID,
+  CONFIG_GOOGLE_LOGIN.CLIENT_SECRET,
+  `${CONFIG_GOOGLE_LOGIN.COMPANION_DOMAIN}/login/google/oauth/callback`
+);
+
+// ==== UTILITY FUNCTIONS ====
+function generateLoginStateToken(origin) {
+  return jwt.sign({ origin }, CONFIG_GOOGLE_LOGIN.JWT_SECRET, { expiresIn: CONFIG_GOOGLE_LOGIN.TOKEN_EXPIRY });
+}
+function verifyLoginStateToken(token) {
+  try {
+    const decoded = jwt.verify(token, CONFIG_GOOGLE_LOGIN.JWT_SECRET);
+    return decoded.origin;
+  } catch (err) {
+    return null;
+  }
+}
+
+// ==== LOGIN: GOOGLE OAUTH FOR PROFILE ====
+app.get('/login/google/oauth', (req, res) => {
+  const { origin } = req.query;
+  if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
+
+  const stateToken = generateLoginStateToken(origin);
+  res.cookie(CONFIG_GOOGLE_LOGIN.COOKIE_NAME, stateToken, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'none',
+    maxAge: 120000, // 2 min
+  });
+
+  const url = loginOauth2Client.generateAuthUrl({
+    access_type: 'online',
+    prompt: 'select_account', // or 'consent' if you want to always show
+    include_granted_scopes: true,
+    scope: [
+      'https://www.googleapis.com/auth/userinfo.email',
+      'https://www.googleapis.com/auth/userinfo.profile'
+    ],
+  });
+  res.redirect(url);
+});
+
+// ==== GOOGLE OAUTH2 CALLBACK (/login/google/oauth/callback)====
+app.get('/login/google/oauth/callback', async (req, res) => {
+  const { code } = req.query;
+  const stateToken = req.cookies[CONFIG_GOOGLE_LOGIN.COOKIE_NAME];
+  if (!stateToken) return res.status(400).send('Missing state token');
+  const origin = verifyLoginStateToken(stateToken);
+  if (!origin) return res.status(400).send('Invalid state token');
+  res.clearCookie(CONFIG_GOOGLE_LOGIN.COOKIE_NAME);
+
+  try {
+    const { tokens } = await loginOauth2Client.getToken(code);
+    loginOauth2Client.setCredentials(tokens);
+
+    const oauth2 = google.oauth2({ version: 'v2', auth: loginOauth2Client });
+    const { data } = await oauth2.userinfo.get();
+
+    // Extract names (prefer given/family, fallback split)
+    let first_name = data.given_name, last_name = data.family_name;
+    if (!first_name || !last_name) {
+      if (data.name) {
+        const parts = data.name.trim().split(/\s+/);
+        first_name = parts[0];
+        last_name = parts.length > 1 ? parts.slice(1).join(' ') : '';
+      } else {
+        first_name = last_name = '';
+      }
+    }
+
+    const infoForJwt = {
+      first_name: first_name,
+      last_name: last_name,
+      email: data.email,
+      picture: data.picture
+    };
+
+    const loginToken = jwt.sign(infoForJwt, CONFIG_GOOGLE_LOGIN.JWT_SECRET, { expiresIn: CONFIG_GOOGLE_LOGIN.TOKEN_EXPIRY });
+
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Google OAuth Login</title>
+        <script>
+          (function() {
+            const token = '${loginToken}';
+            const targetOrigin = '${origin}';
+            const source = 'companion-google-login';
+
+            // Try postMessage to opener
+            if (window.opener && !window.opener.closed) {
+              window.opener.postMessage({
+                source: source,
+                loginToken: token,
+                status: 'success'
+              }, targetOrigin);
+
+              // Fallback: localStorage
+              localStorage.setItem('googleLoginToken', token);
+              localStorage.setItem('googleLoginOrigin', targetOrigin);
+
+              setTimeout(() => window.close(), 100);
+            } else {
+              document.getElementById('auto-close').style.display = 'none';
+              document.getElementById('manual-close').style.display = 'block';
+            }
+
+            window.addEventListener('beforeunload', function() {
+              if (window.opener && !window.opener.closed) {
+                window.opener.postMessage({
+                  source: source, loginToken: token, status: 'success'
+                }, targetOrigin);
+              }
+            });
+          })();
+        </script>
+        <style>
+          body { font-family: Arial, sans-serif; text-align: center; padding: 40px; }
+          #manual-close { display: none; margin-top: 20px; }
+          button { padding: 10px 20px; background: #4285F4; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        </style>
+      </head>
+      <body>
+        <p id="auto-close">Authentication complete. Closing window...</p>
+        <div id="manual-close">
+          <p>Authentication complete. You may now close this window.</p>
+          <button onclick="window.close()">Close Window</button>
+        </div>
+      </body>
+      </html>
+    `);
+  } catch (error) {
+    const safeMsg = ('' + error.message).replace(/'/g, "\\'");
+    console.error("OAuth2 /oauth callback error:", error);
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Authentication Error</title>
+        <script>
+          window.opener && window.opener.postMessage({
+            source: 'companion-google-login',
+            status: 'error',
+            error: '${safeMsg}'
+          }, '${origin}');
+          window.close();
+        </script>
+      </head>
+      <body>
+        <p>Authentication failed. Closing window...</p>
+      </body>
+      </html>
+    `);
+  }
+});
+
+// ==== TOKEN INFO ENDPOINT FOR /login/google/oauth TOKENS ====
+app.get('/login/tokeninfo/google', (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ failed: true, error: 'Token is required' });
+
+  try {
+    const decoded = jwt.verify(token, CONFIG_GOOGLE_LOGIN.JWT_SECRET);
+
+    res.json({
+      first_name: decoded.first_name,
+      last_name: decoded.last_name,
+      email: decoded.email,
+      picture: decoded.picture,
+      failed: false
+    });
+  } catch (err) {
+    console.error("Tokeninfo/google error:", err);
+    res.status(401).json({ failed: true, error: 'Invalid or expired token' });
+  }
+});
+
+
+
+///////////////////////////////////////////////////
 ///////////         Server        /////////////////
 ///////////////////////////////////////////////////
 
