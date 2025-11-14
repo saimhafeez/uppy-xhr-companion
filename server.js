@@ -1873,6 +1873,203 @@ app.get('/login/tokeninfo/apple', (req, res) => {
 });
 
 
+///////////////////////////////////////////////////
+//         LinkedIn Login OAuth (profile)        //
+///////////////////////////////////////////////////
+
+const CONFIG_LINKEDIN_LOGIN = {
+  CLIENT_ID: process.env.LINKEDIN_CLIENT_ID,
+  CLIENT_SECRET: process.env.LINKEDIN_CLIENT_SECRET,
+  JWT_SECRET: process.env.COMPANION_SECRET,
+  TOKEN_EXPIRY: '2m',
+  COOKIE_NAME: 'linkedin_login_state',
+  COMPANION_DOMAIN: `https://${process.env.COMPANION_DOMAIN}`
+};
+
+function generateLinkedinLoginStateToken(origin) {
+  return jwt.sign({ origin }, CONFIG_LINKEDIN_LOGIN.JWT_SECRET, { expiresIn: CONFIG_LINKEDIN_LOGIN.TOKEN_EXPIRY });
+}
+function verifyLinkedinLoginStateToken(token) {
+  try {
+    const decoded = jwt.verify(token, CONFIG_LINKEDIN_LOGIN.JWT_SECRET);
+    return decoded.origin;
+  } catch {
+    return null;
+  }
+}
+
+// ==== 1. Kick off login ====
+app.get('/login/linkedin/oauth', (req, res) => {
+  const { origin } = req.query;
+  if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
+
+  const stateToken = generateLinkedinLoginStateToken(origin);
+  res.cookie(CONFIG_LINKEDIN_LOGIN.COOKIE_NAME, stateToken, {
+    httpOnly: true, secure: true, sameSite: 'none', maxAge: 120000
+  });
+
+  const redirect_uri = `${CONFIG_LINKEDIN_LOGIN.COMPANION_DOMAIN}/login/linkedin/callback`;
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: CONFIG_LINKEDIN_LOGIN.CLIENT_ID,
+    redirect_uri,
+    state: 'linkedin-login',
+    scope: 'r_liteprofile r_emailaddress'
+  });
+
+  res.redirect('https://www.linkedin.com/oauth/v2/authorization?' + params.toString());
+});
+
+// ==== 2. Handle callback and POST to plugin ====
+app.get('/login/linkedin/callback', async (req, res) => {
+  const { code } = req.query;
+  const stateToken = req.cookies[CONFIG_LINKEDIN_LOGIN.COOKIE_NAME];
+  if (!stateToken) return res.status(400).send('Missing state token');
+  const origin = verifyLinkedinLoginStateToken(stateToken);
+  if (!origin) return res.status(400).send('Invalid state token');
+  res.clearCookie(CONFIG_LINKEDIN_LOGIN.COOKIE_NAME);
+
+  try {
+    // 1. Exchange code for access token
+    const redirect_uri = `${CONFIG_LINKEDIN_LOGIN.COMPANION_DOMAIN}/login/linkedin/callback`;
+
+    const tokenResp = await axios.post('https://www.linkedin.com/oauth/v2/accessToken', new URLSearchParams({
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri,
+      client_id: CONFIG_LINKEDIN_LOGIN.CLIENT_ID,
+      client_secret: CONFIG_LINKEDIN_LOGIN.CLIENT_SECRET
+    }).toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+    });
+
+    const access_token = tokenResp.data.access_token;
+
+    // 2. Fetch profile
+    // Official docs: https://docs.microsoft.com/en-us/linkedin/shared/integrations/people/profile-api?context=linkedin/context
+    const meProfileResp = await axios.get('https://api.linkedin.com/v2/me?projection=(id,localizedFirstName,localizedLastName,profilePicture(displayImage~:playableStreams))', {
+      headers: { Authorization: 'Bearer ' + access_token }
+    });
+    const meEmailResp = await axios.get('https://api.linkedin.com/v2/emailAddress?q=members&projection=(elements*(handle~))', {
+      headers: { Authorization: 'Bearer ' + access_token }
+    });
+
+    const profile = meProfileResp.data;
+    const email = (meEmailResp.data.elements[0]['handle~'] && meEmailResp.data.elements[0]['handle~'].emailAddress) || "";
+
+    // Get picture if available
+    let picture = null;
+    try {
+      if (profile.profilePicture && profile.profilePicture['displayImage~'] && profile.profilePicture['displayImage~'].elements) {
+        // Use the last (highest resolution) in the array:
+        const elementsArray = profile.profilePicture['displayImage~'].elements;
+        picture = elementsArray[elementsArray.length - 1].identifiers[0].identifier;
+      }
+    } catch {}
+
+    const infoForJwt = {
+      first_name: profile.localizedFirstName || "",
+      last_name: profile.localizedLastName || "",
+      email,
+      picture: picture || null
+    };
+
+    const loginToken = jwt.sign(infoForJwt, CONFIG_LINKEDIN_LOGIN.JWT_SECRET, { expiresIn: CONFIG_LINKEDIN_LOGIN.TOKEN_EXPIRY });
+
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>LinkedIn OAuth Login</title>
+        <script>
+          (function() {
+            const token = '${loginToken}';
+            const targetOrigin = '${origin}';
+            const source = 'companion-linkedin-login';
+
+            if (window.opener && !window.opener.closed) {
+              window.opener.postMessage({
+                source: source,
+                loginToken: token,
+                status: 'success'
+              }, targetOrigin);
+
+              localStorage.setItem('linkedinLoginToken', token);
+              localStorage.setItem('linkedinLoginOrigin', targetOrigin);
+
+              setTimeout(() => window.close(), 100);
+            } else {
+              document.getElementById('auto-close').style.display = 'none';
+              document.getElementById('manual-close').style.display = 'block';
+            }
+
+            window.addEventListener('beforeunload', function() {
+              if (window.opener && !window.opener.closed) {
+                window.opener.postMessage({
+                  source: source, loginToken: token, status: 'success'
+                }, targetOrigin);
+              }
+            });
+          })();
+        </script>
+        <style>
+          body { font-family: Arial, sans-serif; text-align: center; padding: 40px; }
+          #manual-close { display: none; margin-top: 20px; }
+          button { padding: 10px 20px; background: #0077b5; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        </style>
+      </head>
+      <body>
+        <p id="auto-close">Authentication complete. Closing window...</p>
+        <div id="manual-close">
+          <p>Authentication complete. You may now close this window.</p>
+          <button onclick="window.close()">Close Window</button>
+        </div>
+      </body>
+      </html>
+    `);
+  } catch (error) {
+    const safeMsg = ('' + error.message).replace(/'/g, "\\'");
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>LinkedIn Auth Error</title>
+        <script>
+          window.opener && window.opener.postMessage({
+            source: 'companion-linkedin-login',
+            status: 'error',
+            error: '${safeMsg}'
+          }, '${origin}');
+          window.close();
+        </script>
+      </head>
+      <body>
+        <p>Authentication failed. Closing window...</p>
+      </body>
+      </html>
+    `);
+  }
+});
+
+// ==== 3. Verify JWT endpoint for plugin ====
+app.get('/login/tokeninfo/linkedin', (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ failed: true, error: 'Token is required' });
+  try {
+    const decoded = jwt.verify(token, CONFIG_LINKEDIN_LOGIN.JWT_SECRET);
+    res.json({
+      first_name: decoded.first_name,
+      last_name: decoded.last_name,
+      email: decoded.email,
+      picture: decoded.picture,
+      failed: false
+    });
+  } catch (err) {
+    res.status(401).json({ failed: true, error: 'Invalid or expired token' });
+  }
+});
+
+
 
 ///////////////////////////////////////////////////
 ///////////         Server        /////////////////
