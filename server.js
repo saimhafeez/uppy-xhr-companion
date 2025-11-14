@@ -1873,8 +1873,9 @@ app.get('/login/tokeninfo/apple', (req, res) => {
 });
 
 
+
 ///////////////////////////////////////////////////
-//         LinkedIn Login OAuth (profile)        //
+//         LinkedIn Login OAuth (OpenID)         //
 ///////////////////////////////////////////////////
 
 const CONFIG_LINKEDIN_LOGIN = {
@@ -1909,6 +1910,7 @@ app.get('/login/linkedin/oauth', (req, res) => {
   });
 
   const redirect_uri = `${CONFIG_LINKEDIN_LOGIN.COMPANION_DOMAIN}/login/linkedin/callback`;
+
   const params = new URLSearchParams({
     response_type: 'code',
     client_id: CONFIG_LINKEDIN_LOGIN.CLIENT_ID,
@@ -1930,7 +1932,7 @@ app.get('/login/linkedin/callback', async (req, res) => {
   res.clearCookie(CONFIG_LINKEDIN_LOGIN.COOKIE_NAME);
 
   try {
-    // 1. Exchange code for access token
+    // 1. Exchange code for access_token & id_token
     const redirect_uri = `${CONFIG_LINKEDIN_LOGIN.COMPANION_DOMAIN}/login/linkedin/callback`;
 
     const tokenResp = await axios.post('https://www.linkedin.com/oauth/v2/accessToken', new URLSearchParams({
@@ -1944,33 +1946,52 @@ app.get('/login/linkedin/callback', async (req, res) => {
     });
 
     const access_token = tokenResp.data.access_token;
+    const id_token = tokenResp.data.id_token;
 
-    // 2. Fetch profile
-    // Official docs: https://docs.microsoft.com/en-us/linkedin/shared/integrations/people/profile-api?context=linkedin/context
-    const meProfileResp = await axios.get('https://api.linkedin.com/v2/me?projection=(id,localizedFirstName,localizedLastName,profilePicture(displayImage~:playableStreams))', {
-      headers: { Authorization: 'Bearer ' + access_token }
-    });
-    const meEmailResp = await axios.get('https://api.linkedin.com/v2/emailAddress?q=members&projection=(elements*(handle~))', {
-      headers: { Authorization: 'Bearer ' + access_token }
-    });
+    // 2. Decode the id_token JWT for name/email/profile
+    let first_name = "", last_name = "", email = "", picture = null;
+    if (id_token) {
+      try {
+        // decode JWT
+        const payload = JSON.parse(Buffer.from(id_token.split('.')[1], 'base64').toString());
+        // LinkedIn OpenID typically gives these
+        first_name = payload.given_name || payload.name || "";
+        last_name = payload.family_name || "";
+        email = payload.email || payload.email_verified || "";
+        picture = payload.picture || null;
+        // Fallback: sometimes "sub" or other properties
+        if (!email && payload.sub) email = payload.sub;
+      } catch (e) {}
+    }
 
-    const profile = meProfileResp.data;
-    const email = (meEmailResp.data.elements[0]['handle~'] && meEmailResp.data.elements[0]['handle~'].emailAddress) || "";
+    // If fallback, still get legacy info per old method:
+    if (!first_name || !last_name || !email) {
+      try {
+        // r_liteprofile, r_emailaddress are still allowed together with openid
+        const [profileResp, emailResp] = await Promise.all([
+          axios.get('https://api.linkedin.com/v2/me?projection=(id,localizedFirstName,localizedLastName,profilePicture(displayImage~:playableStreams))', {
+            headers: { Authorization: 'Bearer ' + access_token }
+          }),
+          axios.get('https://api.linkedin.com/v2/emailAddress?q=members&projection=(elements*(handle~))', {
+            headers: { Authorization: 'Bearer ' + access_token }
+          })
+        ]);
+        const profile = profileResp.data;
+        email = (emailResp.data.elements[0]['handle~'] && emailResp.data.elements[0]['handle~'].emailAddress) || email;
+        first_name = profile.localizedFirstName || first_name;
+        last_name = profile.localizedLastName || last_name;
 
-    // Get picture if available
-    let picture = null;
-    try {
-      if (profile.profilePicture && profile.profilePicture['displayImage~'] && profile.profilePicture['displayImage~'].elements) {
-        // Use the last (highest resolution) in the array:
-        const elementsArray = profile.profilePicture['displayImage~'].elements;
-        picture = elementsArray[elementsArray.length - 1].identifiers[0].identifier;
-      }
-    } catch {}
+        if (profile.profilePicture && profile.profilePicture['displayImage~'] && profile.profilePicture['displayImage~'].elements) {
+          const elementsArray = profile.profilePicture['displayImage~'].elements;
+          picture = elementsArray[elementsArray.length - 1].identifiers[0].identifier;
+        }
+      } catch { }
+    }
 
     const infoForJwt = {
-      first_name: profile.localizedFirstName || "",
-      last_name: profile.localizedLastName || "",
-      email,
+      first_name: first_name || "",
+      last_name: last_name || "",
+      email: email || "",
       picture: picture || null
     };
 
@@ -2068,7 +2089,6 @@ app.get('/login/tokeninfo/linkedin', (req, res) => {
     res.status(401).json({ failed: true, error: 'Invalid or expired token' });
   }
 });
-
 
 
 ///////////////////////////////////////////////////
