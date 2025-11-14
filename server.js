@@ -1914,7 +1914,7 @@ app.get('/login/linkedin/oauth', (req, res) => {
     client_id: CONFIG_LINKEDIN_LOGIN.CLIENT_ID,
     redirect_uri,
     state: 'linkedin-login',
-    scope: 'r_liteprofile r_emailaddress'
+    scope: 'openid email profile'
   });
 
   res.redirect('https://www.linkedin.com/oauth/v2/authorization?' + params.toString());
