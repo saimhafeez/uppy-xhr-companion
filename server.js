@@ -986,7 +986,8 @@ const CONFIG_GOOGLE_ANALYTICS = {
   COMPANION_DOMAIN: `https://${process.env.COMPANION_DOMAIN}`,
   SCOPES: [
     // Only what's required for Analytics property/datastream management
-    "https://www.googleapis.com/auth/analytics.edit"
+    "https://www.googleapis.com/auth/analytics.edit",
+    "https://www.googleapis.com/auth/analytics.readonly"
   ]
 };
 
