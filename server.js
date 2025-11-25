@@ -261,7 +261,9 @@ const CONFIG_GOOGLE_CALENDAR = {
   TOKEN_EXPIRY: '5m',
   COOKIE_NAME: 'google_auth_state',
   COMPANION_DOMAIN: `https://${process.env.COMPANION_DOMAIN}`,
-  ALLOWED_REDIRECT_PATHS: ['/'],
+  SCOPES: [
+    'https://www.googleapis.com/auth/calendar'
+  ]
 };
 
 // ==== GOOGLE OAUTH2 CLIENT ====
@@ -270,13 +272,11 @@ const oauth2Client = new google.auth.OAuth2(
   CONFIG_GOOGLE_CALENDAR.CLIENT_SECRET,
   `${CONFIG_GOOGLE_CALENDAR.COMPANION_DOMAIN}/login/google/callback`
 );
-google.options({ auth: oauth2Client });
 
-// ==== UTILITY FUNCTIONS ====
+// ==== STATE UTILS ====
 function generateStateToken(origin) {
   return jwt.sign({ origin }, CONFIG_GOOGLE_CALENDAR.JWT_SECRET, { expiresIn: CONFIG_GOOGLE_CALENDAR.TOKEN_EXPIRY });
 }
-
 function verifyStateToken(token) {
   try {
     const decoded = jwt.verify(token, CONFIG_GOOGLE_CALENDAR.JWT_SECRET);
@@ -286,7 +286,7 @@ function verifyStateToken(token) {
   }
 }
 
-// ==== LOGIN: GOOGLE CALENDAR WITH REFRESH TOKEN ====
+// ==== LOGIN ENDPOINT ====
 app.get('/login/google/calendar', (req, res) => {
   const { origin } = req.query;
   if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
@@ -296,23 +296,19 @@ app.get('/login/google/calendar', (req, res) => {
     httpOnly: true,
     secure: true,
     sameSite: 'none',
-    maxAge: 300000, // 5 min
+    maxAge: 5 * 60 * 1000 // 5 minutes
   });
 
   const url = oauth2Client.generateAuthUrl({
     access_type: 'offline',
-    prompt: 'consent', // Always prompt for consent to force refresh_token
-    include_granted_scopes: true,
-    scope: [
-      'https://www.googleapis.com/auth/userinfo.email',
-      'https://www.googleapis.com/auth/userinfo.profile',
-      'https://www.googleapis.com/auth/calendar',
-    ],
+    prompt: 'consent',
+    include_granted_scopes: false,
+    scope: CONFIG_GOOGLE_CALENDAR.SCOPES
   });
   res.redirect(url);
 });
 
-// ==== GOOGLE OAUTH2 CALLBACK ====
+// ==== CALLBACK ENDPOINT ====
 app.get('/login/google/callback', async (req, res) => {
   const { code } = req.query;
   const stateToken = req.cookies[CONFIG_GOOGLE_CALENDAR.COOKIE_NAME];
@@ -323,45 +319,32 @@ app.get('/login/google/callback', async (req, res) => {
 
   try {
     const { tokens } = await oauth2Client.getToken(code);
-    oauth2Client.setCredentials(tokens);
-
-    // User info
-    const oauth2 = google.oauth2({ version: 'v2', auth: oauth2Client });
-    const { data } = await oauth2.userinfo.get();
 
     const refresh_token = tokens.refresh_token || null;
-    const refresh_token_expires_in = tokens.expiry_date
+    const access_token = tokens.access_token || null;
+    const expires_in = tokens.expiry_date
       ? Math.floor((tokens.expiry_date - Date.now()) / 1000)
       : null;
 
     const infoForJwt = {
       refresh_token,
-      refresh_token_expires_in,
-      email: data.email,
-      name: data.name,
-      picture: data.picture,
+      access_token,
+      expires_in
     };
 
     const loginToken = jwt.sign(infoForJwt, CONFIG_GOOGLE_CALENDAR.JWT_SECRET, { expiresIn: '2m' });
-
-    // If 'refresh_token' present, send as calendar source, else regular login
-    const isCalendar = refresh_token !== null;
-    const postMessageSource = isCalendar ? 'companion-google-calendar' : 'companion-google-login';
-    const storageTokenKey = isCalendar ? 'googleCalendarRefreshToken' : 'googleAuthToken';
-    const storageOriginKey = isCalendar ? 'googleCalendarAuthOrigin' : 'googleAuthOrigin';
 
     res.send(`
       <!DOCTYPE html>
       <html>
       <head>
-        <title>Google Authentication</title>
+        <title>Google Calendar Authentication</title>
         <script>
           (function() {
             const token = '${loginToken}';
             const targetOrigin = '${origin}';
-            const source = '${postMessageSource}';
+            const source = 'companion-google-calendar';
 
-            // Try immediate postMessage to popup opener
             if (window.opener && !window.opener.closed) {
               window.opener.postMessage({
                 source: source,
@@ -369,9 +352,8 @@ app.get('/login/google/callback', async (req, res) => {
                 status: 'success'
               }, targetOrigin);
 
-              // Fallback: store in localStorage
-              localStorage.setItem('${storageTokenKey}', token);
-              localStorage.setItem('${storageOriginKey}', targetOrigin);
+              localStorage.setItem('googleCalendarRefreshToken', token);
+              localStorage.setItem('googleCalendarAuthOrigin', targetOrigin);
 
               setTimeout(() => window.close(), 100);
             } else {
@@ -381,9 +363,7 @@ app.get('/login/google/callback', async (req, res) => {
 
             window.addEventListener('beforeunload', function() {
               if (window.opener && !window.opener.closed) {
-                window.opener.postMessage({
-                  source: source, loginToken: token, status: 'success'
-                }, targetOrigin);
+                window.opener.postMessage({ source: source, loginToken: token, status: 'success' }, targetOrigin);
               }
             });
           })();
@@ -404,13 +384,12 @@ app.get('/login/google/callback', async (req, res) => {
       </html>
     `);
   } catch (error) {
-    const safeMsg = ('' + error.message).replace(/'/g, "\\'");
-    console.error("OAuth2 callback error:", error); // log for debugging
+    const safeMsg = ("" + error.message).replace(/'/g, "\\'");
     res.send(`
       <!DOCTYPE html>
       <html>
       <head>
-        <title>Authentication Error</title>
+        <title>Google Calendar Error</title>
         <script>
           window.opener && window.opener.postMessage({
             source: 'companion-google-calendar',
@@ -428,7 +407,7 @@ app.get('/login/google/callback', async (req, res) => {
   }
 });
 
-// ==== CALENDAR TOKEN VERIFY ENDPOINT ====
+// ==== TOKEN INFO VERIFICATION ENDPOINT ====
 app.get('/login/tokeninfo/calendar', (req, res) => {
   const { token } = req.query;
   if (!token) return res.status(400).json({ failed: true, error: 'Token is required' });
@@ -440,14 +419,11 @@ app.get('/login/tokeninfo/calendar', (req, res) => {
     }
     res.json({
       refresh_token: decoded.refresh_token,
-      refresh_token_expires_in: decoded.refresh_token_expires_in,
-      email: decoded.email,
-      name: decoded.name,
-      picture: decoded.picture,
+      access_token: decoded.access_token,
+      expires_in: decoded.expires_in,
       failed: false
     });
   } catch (err) {
-    console.error("Tokeninfo/calendar error:", err);
     res.status(401).json({ failed: true, error: 'Invalid or expired token' });
   }
 });
@@ -1179,7 +1155,10 @@ const CONFIG_GOOGLE_MEET = {
   JWT_SECRET: process.env.COMPANION_SECRET,
   TOKEN_EXPIRY: '5m',
   COOKIE_NAME: 'google_meet_auth_state',
-  COMPANION_DOMAIN: `https://${process.env.COMPANION_DOMAIN}`
+  COMPANION_DOMAIN: `https://${process.env.COMPANION_DOMAIN}`,
+  SCOPES: [
+    "https://www.googleapis.com/auth/meetings.space.created"
+  ]
 };
 
 const meetOauth2Client = new google.auth.OAuth2(
@@ -1215,17 +1194,12 @@ app.get('/login/google/meet', (req, res) => {
   const url = meetOauth2Client.generateAuthUrl({
     access_type: 'offline',
     prompt: 'consent',
-    scope: [
-      'https://www.googleapis.com/auth/userinfo.email',
-      'https://www.googleapis.com/auth/userinfo.profile',
-      'https://www.googleapis.com/auth/calendar', // Required for Meet management
-      'https://www.googleapis.com/auth/meetings.space.created' // To Create and Manage Spaces
-    ]
+    include_granted_scopes: false,
+    scope: CONFIG_GOOGLE_MEET.SCOPES
   });
   res.redirect(url);
 });
 
-// ==== GOOGLE MEET OAUTH2 CALLBACK ====
 app.get('/login/google/meet/callback', async (req, res) => {
   const { code } = req.query;
   const stateToken = req.cookies[CONFIG_GOOGLE_MEET.COOKIE_NAME];
@@ -1236,28 +1210,21 @@ app.get('/login/google/meet/callback', async (req, res) => {
 
   try {
     const { tokens } = await meetOauth2Client.getToken(code);
-    meetOauth2Client.setCredentials(tokens);
-
-    // User info
-    const oauth2 = google.oauth2({ version: 'v2', auth: meetOauth2Client });
-    const { data } = await oauth2.userinfo.get();
 
     const refresh_token = tokens.refresh_token || null;
-    const refresh_token_expires_in = tokens.expiry_date
+    const access_token = tokens.access_token || null;
+    const expires_in = tokens.expiry_date
       ? Math.floor((tokens.expiry_date - Date.now()) / 1000)
       : null;
 
     const infoForJwt = {
       refresh_token,
-      refresh_token_expires_in,
-      email: data.email,
-      name: data.name,
-      picture: data.picture,
+      access_token,
+      expires_in
     };
 
     const loginToken = jwt.sign(infoForJwt, CONFIG_GOOGLE_MEET.JWT_SECRET, { expiresIn: '2m' });
 
-    // For localStorage/postMessage keys (keep these unique to Google Meet flow)
     res.send(`
       <!DOCTYPE html>
       <html>
@@ -1335,17 +1302,14 @@ app.get('/login/tokeninfo/meet', (req, res) => {
     }
     res.json({
       refresh_token: decoded.refresh_token,
-      refresh_token_expires_in: decoded.refresh_token_expires_in,
-      email: decoded.email,
-      name: decoded.name,
-      picture: decoded.picture,
+      access_token: decoded.access_token,
+      expires_in: decoded.expires_in,
       failed: false
     });
   } catch (err) {
     res.status(401).json({ failed: true, error: 'Invalid or expired token' });
   }
 });
-
 
 
 ///////////////////////////////////////////////////
