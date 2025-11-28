@@ -1136,7 +1136,8 @@ const ipx = createIPX({
   httpStorage: ipxHttpStorage({
     domains: [
       "upward.s3.us-east-2.wasabisys.com",
-      "aa70287ff58ea68c3f5d2d6e98c40119.cdn.bubble.io"
+      "aa70287ff58ea68c3f5d2d6e98c40119.cdn.bubble.io",
+      "s3.us-east-2.wasabisys.com"
       // ,"another-allowed-remote-host.com"
     ]
     // You can also use a RegExp/string for wildcards if needed, but restrict as much as possible for security!
