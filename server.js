@@ -162,7 +162,7 @@ const options = {
       key: process.env.ONEDRIVE_KEY,
       secret: process.env.ONEDRIVE_SECRET
     },
-    enableGooglePickerEndpoint: COMPANION_ENABLE_GOOGLE_PICKER_ENDPOINT
+    enableGooglePickerEndpoint: "COMPANION_ENABLE_GOOGLE_PICKER_ENDPOINT"
   },
   server: {
     host: process.env.COMPANION_DOMAIN,
