@@ -170,7 +170,7 @@ const options = {
   filePath: '/tmp',
   secret: process.env.COMPANION_SECRET,
   debug: true,
-  enableGooglePickerEndpoint: "COMPANION_ENABLE_GOOGLE_PICKER_ENDPOINT",
+  enableGooglePickerEndpoint: true,
   uploadUrls: ['.*']
 };
 
