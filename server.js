@@ -161,8 +161,7 @@ const options = {
     onedrive: {
       key: process.env.ONEDRIVE_KEY,
       secret: process.env.ONEDRIVE_SECRET
-    },
-    COMPANION_ENABLE_GOOGLE_PICKER_ENDPOINT: true
+    }
   },
   server: {
     host: process.env.COMPANION_DOMAIN,
@@ -171,6 +170,7 @@ const options = {
   filePath: '/tmp',
   secret: process.env.COMPANION_SECRET,
   debug: true,
+  enableGooglePickerEndpoint: true,
   uploadUrls: ['.*']
 };
 
