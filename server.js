@@ -22,6 +22,7 @@ const axios = require('axios');
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
+
 // Wasabi Config
 const WASABI_BUCKET = process.env.WASABI_BUCKET;
 const WASABI_REGION = process.env.WASABI_REGION;
@@ -246,6 +247,53 @@ app.post('/upload', (req, res) => {
       res.status(500).json({ error: e.message });
     }
   });
+});
+
+///////////////////////////////////////////////////
+////////     Wasabi Presign Upload    /////////////
+///////////////////////////////////////////////////
+
+app.options('/wasabi_presign_upload', (req, res) => {
+  res.set('Access-Control-Allow-Origin', 'https://upward.page');
+  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type, Accept');
+  res.status(204).end();
+});
+
+app.post('/wasabi_presign_upload', express.json(), async (req, res) => {
+  if (req.get('Origin') !== 'https://upward.page') {
+    return res.status(403).json({ error: 'Origin not allowed.' });
+  }
+
+  const { file_name, folder_structure, mimetype } = req.body;
+  if (!file_name || typeof file_name !== "string" || !folder_structure || typeof folder_structure !== "string") {
+    return res.status(400).json({ error: 'file_name and folder_structure required' });
+  }
+
+  // Normalize folder_structure (remove leading slash, ensure trailing slash if present)
+  let folder = folder_structure.replace(/^\/+/, '');
+  if (folder && !folder.endsWith('/')) folder += '/';
+
+  // S3/Wasabi key
+  const key = `${folder}${file_name}`;
+  const contentType = mimetype || 'application/octet-stream';
+
+  const command = new PutObjectCommand({
+    Bucket: WASABI_BUCKET,
+    Key: key,
+    ContentType: contentType,
+    ACL: 'public-read'
+  });
+
+  try {
+    const uploadUrl = await getSignedUrl(s3, command, { expiresIn: 300 });
+    const fileUrl = `https://${WASABI_BUCKET}.s3.${WASABI_REGION}.wasabisys.com/${key}`;
+
+    res.set('Access-Control-Allow-Origin', 'https://upward.page');
+    res.json({ uploadUrl, fileUrl });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 ///////////////////////////////////////////////////
