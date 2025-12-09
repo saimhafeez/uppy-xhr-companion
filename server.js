@@ -35,7 +35,7 @@ const MUX_TOKEN_ID = process.env.MUX_TOKEN_ID;
 const MUX_TOKEN_SECRET = process.env.MUX_TOKEN_SECRET;
 
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
-fs.mkdir(UPLOAD_DIR, { recursive: true }).catch(() => {});
+fs.mkdir(UPLOAD_DIR, { recursive: true }).catch(() => { });
 
 // S3: Wasabi (SDK v3)
 const s3 = new S3Client({
@@ -233,7 +233,7 @@ app.post('/upload', (req, res) => {
         result = { wasabi_url: url };
       }
 
-      await fs.unlink(filepath).catch(() => {});
+      await fs.unlink(filepath).catch(() => { });
 
       res.status(200).json({
         ok: true,
@@ -253,12 +253,12 @@ app.post('/upload', (req, res) => {
 ////////     Wasabi Presign Upload    /////////////
 ///////////////////////////////////////////////////
 
-// app.options('/wasabi_presign_upload', (req, res) => {
-//   res.set('Access-Control-Allow-Origin', 'https://upward.page');
-//   res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
-//   res.set('Access-Control-Allow-Headers', 'Content-Type, Accept');
-//   res.status(204).end();
-// });
+app.options('/wasabi_presign_upload', (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type, Accept');
+  res.status(204).end();
+});
 
 app.post('/wasabi_presign_upload', express.json(), async (req, res) => {
   //if (req.get('Origin') !== 'https://upward.page') {
@@ -289,13 +289,12 @@ app.post('/wasabi_presign_upload', express.json(), async (req, res) => {
     const uploadUrl = await getSignedUrl(s3, command, { expiresIn: 300 });
     const fileUrl = `https://${WASABI_BUCKET}.s3.${WASABI_REGION}.wasabisys.com/${key}`;
 
-    res.set('Access-Control-Allow-Origin', 'https://upward.page');
+    res.set('Access-Control-Allow-Origin', '*');
     res.json({ uploadUrl, fileUrl });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
-});
-
+})
 ///////////////////////////////////////////////////
 ///////////    Google Calendar    /////////////////
 ///////////////////////////////////////////////////
@@ -537,13 +536,13 @@ app.get('/login/outlook/calendar', (req, res) => {
     maxAge: 300000, // 5 min
   });
 
-  const authorizationUri = `https://login.microsoftonline.com/common/oauth2/v2.0/authorize?`+
+  const authorizationUri = `https://login.microsoftonline.com/common/oauth2/v2.0/authorize?` +
     `response_type=code` +
     `&client_id=${encodeURIComponent(CONFIG_OUTLOOK_CALENDAR.CLIENT_ID)}` +
     `&redirect_uri=${encodeURIComponent(CONFIG_OUTLOOK_CALENDAR.REDIRECT_URI)}` +
     `&scope=${encodeURIComponent(CONFIG_OUTLOOK_CALENDAR.SCOPE.join(' '))}` +
     `&prompt=consent`;
-    
+
   console.log("MS Authorize URI:", authorizationUri);
   res.redirect(authorizationUri);
 });
@@ -642,9 +641,9 @@ app.get('/login/outlook/callback', async (req, res) => {
               const base64 = Buffer.from(picBuf).toString('base64');
               picture = 'data:image/jpeg;base64,' + base64;
             }
-          } catch(_) {}
+          } catch (_) { }
         }
-      } catch(e) {}
+      } catch (e) { }
     }
 
     const infoForJwt = {
@@ -864,7 +863,7 @@ app.get('/login/zoom/callback', async (req, res) => {
     catch (e) { throw new Error("Token response was not JSON: " + tokenRaw.slice(0, 100)); }
 
     if (tokenObj.error) {
-      throw new Error(`Token error: ${tokenObj.error} - ${tokenObj.reason||''}`);
+      throw new Error(`Token error: ${tokenObj.error} - ${tokenObj.reason || ''}`);
     }
 
     const refresh_token = tokenObj.refresh_token || null;
@@ -888,7 +887,7 @@ app.get('/login/zoom/callback', async (req, res) => {
           // For Zoom, fetching a profile picture URL is not always possible (pro accounts)
           picture = meData.pic_url || null;
         }
-      } catch(_) {}
+      } catch (_) { }
     }
 
     const infoForJwt = {
@@ -1806,14 +1805,14 @@ app.post('/login/apple/callback', express.urlencoded({ extended: true }), (req, 
       first_name = userObj.name ? userObj.name.firstName : "";
       last_name = userObj.name ? userObj.name.lastName : "";
       email = userObj.email || "";
-    } catch (e) {}
+    } catch (e) { }
   }
   // If not present, fallback: email from id_token
   if (!email && req.body.id_token) {
     try {
       const decoded = JSON.parse(Buffer.from(req.body.id_token.split('.')[1], 'base64').toString());
       email = decoded.email || "";
-    } catch (e) {}
+    } catch (e) { }
   }
 
   const infoForJwt = {
@@ -1975,7 +1974,7 @@ app.get('/login/linkedin/callback', async (req, res) => {
         picture = payload.picture || null;
         // Fallback: sometimes "sub" or other properties
         if (!email && payload.sub) email = payload.sub;
-      } catch (e) {}
+      } catch (e) { }
     }
 
     // If fallback, still get legacy info per old method:
