@@ -253,17 +253,17 @@ app.post('/upload', (req, res) => {
 ////////     Wasabi Presign Upload    /////////////
 ///////////////////////////////////////////////////
 
-app.options('/wasabi_presign_upload', (req, res) => {
-  res.set('Access-Control-Allow-Origin', 'https://upward.page');
-  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.set('Access-Control-Allow-Headers', 'Content-Type, Accept');
-  res.status(204).end();
-});
+// app.options('/wasabi_presign_upload', (req, res) => {
+//   res.set('Access-Control-Allow-Origin', 'https://upward.page');
+//   res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+//   res.set('Access-Control-Allow-Headers', 'Content-Type, Accept');
+//   res.status(204).end();
+// });
 
 app.post('/wasabi_presign_upload', express.json(), async (req, res) => {
-  if (req.get('Origin') !== 'https://upward.page') {
-    return res.status(403).json({ error: 'Origin not allowed.' });
-  }
+  //if (req.get('Origin') !== 'https://upward.page') {
+  //  return res.status(403).json({ error: 'Origin not allowed.' });
+  //}
 
   const { file_name, folder_structure, mimetype } = req.body;
   if (!file_name || typeof file_name !== "string" || !folder_structure || typeof folder_structure !== "string") {
