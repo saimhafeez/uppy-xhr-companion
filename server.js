@@ -2125,6 +2125,18 @@ const gdriveOauth2Client = new google.auth.OAuth2(
   `https://services.upward.page/login/gdrive_picker/callback`
 );
 
+function generateGDriveStateToken(origin) {
+  return jwt.sign({ origin }, CONFIG_GDRIVE_PICKER.JWT_SECRET, { expiresIn: CONFIG_GDRIVE_PICKER.TOKEN_EXPIRY });
+}
+function verifyGDriveStateToken(token) {
+  try {
+    const decoded = jwt.verify(token, CONFIG_GDRIVE_PICKER.JWT_SECRET);
+    return decoded.origin;
+  } catch (err) {
+    return null;
+  }
+}
+
 // --- 1. Start Google Drive Picker OAuth
 app.get('/login/gdrive_picker', (req, res) => {
   const { origin } = req.query;
