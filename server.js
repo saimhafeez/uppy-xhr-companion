@@ -2279,6 +2279,47 @@ app.post('/unlayer_editor_mux_upload', async (req, res) => {
 });
 
 
+// (Requires Mux Node SDK or fetch)
+app.get('/unlayer_mux_upload_status', async (req, res) => {
+  try {
+    const { upload_id } = req.query;
+    if (!upload_id) return res.status(400).json({ error: "Missing upload_id" });
+    // Query Mux Direct Uploads API to get the associated asset
+    const response = await fetch('https://api.mux.com/video/v1/uploads/' + upload_id, {
+      headers: {
+        'Authorization': 'Basic ' + Buffer.from(`${MUX_TOKEN_ID}:${MUX_TOKEN_SECRET}`).toString('base64')
+      }
+    });
+    if (!response.ok) throw new Error("Mux status error");
+    const data = await response.json();
+    const upload = data.data;
+    if (upload.asset_id) {
+      // now get the playback ID!
+      const assetResp = await fetch('https://api.mux.com/video/v1/assets/' + upload.asset_id, {
+        headers: {
+          'Authorization': 'Basic ' + Buffer.from(`${MUX_TOKEN_ID}:${MUX_TOKEN_SECRET}`).toString('base64')
+        }
+      });
+      const assetData = await assetResp.json();
+      const asset = assetData.data;
+      if (asset.playback_ids && asset.playback_ids[0]) {
+        // Return the ready-to-play Mux "Playback URL!"
+        res.json({
+          playback_id: asset.playback_ids[0].id,
+          playback_url: `https://stream.mux.com/${asset.playback_ids[0].id}.m3u8`,
+          status: asset.status
+        });
+        return;
+      }
+    }
+    // Not ready yet
+    res.json({ status: upload.status });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
 ///////////////////////////////////////////////////
 ///////////         Server        /////////////////
 ///////////////////////////////////////////////////
