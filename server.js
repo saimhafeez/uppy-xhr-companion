@@ -2222,6 +2222,64 @@ app.get('/login/gdrive_picker/callback', async (req, res) => {
 
 
 ///////////////////////////////////////////////////
+//////////    UNLAYER MUX UPLOAD    ///////////////
+///////////////////////////////////////////////////
+
+app.options('/unlayer_editor_mux_upload', (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type');
+  res.status(204).end();
+});
+
+app.post('/unlayer_editor_mux_upload', async (req, res) => {
+  try {
+    const { filename, mimetype } = req.body || {};
+    if (!filename) return res.status(400).json({ error: "Missing filename" });
+    // Optionally validate file extension or mimetype
+
+    // 1. Create Mux Direct Upload (get upload URL and asset ID)
+    const external_id = randomUUID();
+
+    const response = await fetch('https://api.mux.com/video/v1/uploads', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Basic ' + Buffer.from(`${MUX_TOKEN_ID}:${MUX_TOKEN_SECRET}`).toString('base64')
+      },
+      body: JSON.stringify({
+        new_asset_settings: {
+          playback_policies: ['public'],
+          passthrough: filename,
+          meta: { external_id }
+        },
+        cors_origin: "*"
+      })
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`MUX upload create failed: ${response.status}: ${text}`);
+    }
+
+    const json = await response.json();
+    const { url: upload_url, id: upload_id } = json.data || {};
+
+    // 2. Respond with upload_url and id. Frontend should upload using a PUT to that URL.
+    res.status(200).json({
+      ok: true,
+      upload_url,
+      upload_id,
+      external_id
+    });
+  } catch (e) {
+    console.error('unlayer_editor_mux_upload error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
+///////////////////////////////////////////////////
 ///////////         Server        /////////////////
 ///////////////////////////////////////////////////
 
