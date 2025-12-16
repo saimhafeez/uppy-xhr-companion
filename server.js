@@ -2105,6 +2105,105 @@ app.get('/login/tokeninfo/linkedin', (req, res) => {
 
 
 ///////////////////////////////////////////////////
+/////////    GOOGLE DRIVE PICKER    ///////////////
+///////////////////////////////////////////////////
+
+const loginOauth2Client = new google.auth.OAuth2(
+  '231297576692-c70ckvdglp7vtnamitq3h2ccrodkdi8a.apps.googleusercontent.com',
+  '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,
+  'https://services.upward.page/login/gdrive_picker/callback'
+);
+
+// ==== LOGIN: GOOGLE DRIVE PICKER OAUTH ====
+app.get('/login/gdrive_picker', (req, res) => {
+  const { origin } = req.query;
+  if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
+
+  // Save the origin in a JWT or cookie (prevents CSRF, ties session to correct opener)
+  const stateToken = generateLoginStateToken(origin);
+  res.cookie('gdrive_picker_state', stateToken, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'none',
+    maxAge: 2 * 60 * 1000, // 2 min
+  });
+
+  const url = loginOauth2Client.generateAuthUrl({
+    access_type: 'online',
+    prompt: 'select_account',
+    include_granted_scopes: false,
+    scope: [
+      'https://www.googleapis.com/auth/drive.readonly'
+    ],
+    // No need to set redirect_uri here, already set in oauth2 client config
+    // Ensure loginOauth2Client was initialized with the correct callback URL!
+  });
+
+  res.redirect(url);
+});
+
+// ==== OAUTH2 CALLBACK FOR GOOGLE DRIVE PICKER ====
+app.get('/login/gdrive_picker/callback', async (req, res) => {
+  const { code } = req.query;
+  const stateToken = req.cookies['gdrive_picker_state'];
+  if (!stateToken) return res.status(400).send('Missing state token');
+  const origin = verifyLoginStateToken(stateToken); // Decrypt JWT to get origin
+  if (!origin) return res.status(400).send('Invalid or expired state token');
+  res.clearCookie('gdrive_picker_state');
+
+  try {
+    // Exchange code for access_token
+    const { tokens } = await loginOauth2Client.getToken(code);
+    const access_token = tokens.access_token;
+
+    // Render a page that postMessages the token to the opener (Bubble page)
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Google Drive Auth</title>
+        <script>
+          (function() {
+            window.opener && window.opener.postMessage({
+              source: 'companion-google-login',
+              status: 'success',
+              access_token: '${access_token}'
+            }, '${origin}');
+            setTimeout(() => window.close(), 150);
+          })();
+        </script>
+      </head>
+      <body>
+        <p>Google Drive authentication complete. You may close this window.</p>
+      </body>
+      </html>
+    `);
+  } catch (error) {
+    const safeMsg = String(error && error.message || error).replace(/'/g, "\\'");
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Google Drive Auth Failed</title>
+        <script>
+          window.opener && window.opener.postMessage({
+            source: 'companion-google-login',
+            status: 'error',
+            error: '${safeMsg}'
+          }, '${origin}');
+          window.close();
+        </script>
+      </head>
+      <body>
+        <p>Google authentication failed. You may close this window.</p>
+      </body>
+      </html>
+    `);
+  }
+});
+
+
+///////////////////////////////////////////////////
 ///////////         Server        /////////////////
 ///////////////////////////////////////////////////
 
