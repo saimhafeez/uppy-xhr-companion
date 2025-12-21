@@ -98,7 +98,8 @@ async function uploadToMux({ filepath, mimetype, originalFilename }) {
       new_asset_settings: {
         playback_policies: ['public'],
         passthrough: originalFilename,
-        meta: { external_id }
+        meta: { external_id },
+        master_access: "temporary"
       }
     })
   });
