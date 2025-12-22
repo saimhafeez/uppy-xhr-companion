@@ -2348,6 +2348,7 @@ app.post("/gpt", async (req, res) => {
       })
     });
     const data = await openaiRes.json();
+    console.log("data", data)
     // Forward just the AI's message (for security)
     res.json({
       content: data.choices && data.choices[0] && data.choices[0].message.content || ""
