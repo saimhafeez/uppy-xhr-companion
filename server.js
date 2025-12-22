@@ -2335,8 +2335,7 @@ app.post("/gpt", async (req, res) => {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        // DO NOT expose this key to front end!
-        "Authorization": "Bearer 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"
+        "Authorization": "Bearer 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"
       },
       body: JSON.stringify({
         model: "gpt-3.5-turbo",
@@ -2344,7 +2343,7 @@ app.post("/gpt", async (req, res) => {
           { role: "system", content: "You are a helpful content assistant." },
           { role: "user", content: prompt }
         ],
-        max_tokens: 256
+        max_tokens: 4018
       })
     });
     const data = await openaiRes.json();
