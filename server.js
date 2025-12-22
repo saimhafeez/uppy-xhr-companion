@@ -2321,6 +2321,43 @@ app.get('/unlayer_mux_upload_status', async (req, res) => {
 });
 
 
+
+///////////////////////////////////////////////////
+///////////         GPT        /////////////////
+///////////////////////////////////////////////////
+
+app.post("/gpt", async (req, res) => {
+  const { prompt } = req.body;
+  if (!prompt) return res.status(400).json({ error: "No prompt" });
+
+  try {
+    const openaiRes = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        // DO NOT expose this key to front end!
+        "Authorization": "Bearer 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"
+      },
+      body: JSON.stringify({
+        model: "gpt-3.5-turbo",
+        messages: [
+          { role: "system", content: "You are a helpful content assistant." },
+          { role: "user", content: prompt }
+        ],
+        max_tokens: 256
+      })
+    });
+    const data = await openaiRes.json();
+    // Forward just the AI's message (for security)
+    res.json({
+      content: data.choices && data.choices[0] && data.choices[0].message.content || ""
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
 ///////////////////////////////////////////////////
 ///////////         Server        /////////////////
 ///////////////////////////////////////////////////
