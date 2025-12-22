@@ -2336,7 +2336,7 @@ app.post("/gpt", async (req, res) => {
       headers: {
         "Content-Type": "application/json",
         // DO NOT expose this key to front end!
-        "Authorization": "Bearer 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"
+        "Authorization": "Bearer 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"
       },
       body: JSON.stringify({
         model: "gpt-3.5-turbo",
