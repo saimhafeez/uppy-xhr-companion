@@ -48,12 +48,24 @@ const s3 = new S3Client({
   forcePathStyle: true // Important for Wasabi
 });
 
-const isVideoOrAudio = mimetype =>
-  mimetype && (
-    mimetype.startsWith('video/') ||
-    mimetype.startsWith('audio/') ||
-    mimetype === 'application/mp4'
-  );
+const isVideoOrAudio = (mimetype, originalFilename) => {
+  // existing logic
+  if (
+    mimetype && (
+      mimetype.startsWith('video/') ||
+      mimetype.startsWith('audio/') ||
+      mimetype === 'application/mp4' ||
+      mimetype === 'application/vnd.apple.mpegurl'
+    )
+  ) {
+    return true;
+  }
+  // check by file extension
+  if (originalFilename && originalFilename.toLowerCase().endsWith('.m3u8')) {
+    return true;
+  }
+  return false;
+};
 
 // ---- Streaming upload helpers
 
@@ -226,7 +238,7 @@ app.post('/upload', (req, res) => {
       const safeName = originalFilename.replace(/[^\w.\-]/g, '_');
 
       let result = {};
-      if (isVideoOrAudio(mimetype)) {
+      if (isVideoOrAudio(mimetype, originalFilename)) {
         result = await uploadToMux({ filepath, mimetype, originalFilename });
       } else {
         const wasabiKey = `${timestamp}_${safeName}`;
