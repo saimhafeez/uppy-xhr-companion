@@ -2335,7 +2335,7 @@ app.post("/gpt", async (req, res) => {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": "Bearer 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"
+        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`
       },
       body: JSON.stringify({
         model: "gpt-3.5-turbo",
