@@ -2377,9 +2377,9 @@ app.put('/mux/assets/:asset_id/master-access', async (req, res) => {
   res.json(data);
 });
 
-app.get('/mux/assets/:asset_id/master-access', async (req, res) => {
+app.get('/mux/assets/:asset_id', async (req, res) => {
   const asset_id = req.params.asset_id;
-  const muxRes = await fetch(`https://api.mux.com/video/v1/assets/${asset_id}/master-access`, {
+  const muxRes = await fetch(`https://api.mux.com/video/v1/assets/${asset_id}`, {
     headers: {
       'Authorization': 'Basic ' + Buffer.from(`${MUX_TOKEN_ID}:${MUX_TOKEN_SECRET}`).toString('base64'),
       'Accept': 'application/json'
