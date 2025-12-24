@@ -2327,31 +2327,37 @@ app.get('/unlayer_mux_upload_status', async (req, res) => {
 ///////////////////////////////////////////////////
 
 app.post("/gpt", async (req, res) => {
-  const { prompt } = req.body;
+  const { prompt, instructions } = req.body;
   if (!prompt) return res.status(400).json({ error: "No prompt" });
 
+  // Build API payload
+  const payload = {
+    model: "gpt-4.1",
+    input: prompt,
+    tools: [{ type: "web_search_preview" }]
+  };
+  // Only add `instructions` if it exists
+  if (instructions) {
+    payload.instructions = instructions;
+  }
+
   try {
-    const openaiRes = await fetch("https://api.openai.com/v1/chat/completions", {
+    const openaiRes = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "Authorization": "Bearer " + process.env.OPENAI_API_KEY
       },
-      body: JSON.stringify({
-        model: "gpt-3.5-turbo",
-        messages: [
-          { role: "system", content: "You are a helpful content assistant." },
-          { role: "user", content: prompt }
-        ],
-        max_tokens: 4018
-      })
+      body: JSON.stringify(payload)
     });
+
     const data = await openaiRes.json();
-    console.log("data", data)
-    // Forward just the AI's message (for security)
-    res.json({
-      content: data.choices && data.choices[0] && data.choices[0].message.content || ""
-    });
+    // Find the "message" type output
+    const messageOutput = data.output?.find(item => item.type === "message");
+    // Find the content (text) in the message output
+    const outputText = messageOutput?.content?.find(c => c.type === "output_text")?.text || "";
+
+    res.json({ content: outputText });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
