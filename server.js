@@ -2117,7 +2117,7 @@ const CONFIG_GDRIVE_PICKER = {
   COMPANION_DOMAIN: 'services.upward.page',
   COOKIE_NAME:   'gdrive_picker_state',
   TOKEN_EXPIRY:  '3m',
-  SCOPE:         'https://www.googleapis.com/auth/drive.readonly'
+  SCOPE:         'https://www.googleapis.com/auth/drive.file'
 };
 
 const gdriveOauth2Client = new google.auth.OAuth2(
