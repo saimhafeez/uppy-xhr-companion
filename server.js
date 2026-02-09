@@ -16,6 +16,7 @@ const jwt = require('jsonwebtoken');
 // IPX
 const { createIPX, ipxFSStorage, ipxHttpStorage, createIPXNodeServer } = require('ipx');
 const axios = require('axios');
+const dns = require('dns').promises;
 
 
 // AWS SDK v3
@@ -2394,6 +2395,51 @@ app.get('/mux/assets/:asset_id', async (req, res) => {
   const data = await muxRes.json();
   res.json(data);
 });
+
+
+
+///////////////////////////////////////////////////
+///////////      DNS Records      /////////////////
+///////////////////////////////////////////////////
+
+app.get('/dns', async (req, res) => {
+  const { domain } = req.query;
+
+  if (!domain) {
+    return res.status(400).json({ error: 'Domain parameter is required' });
+  }
+
+  try {
+    // Perform lookups in parallel
+    const [a, aaaa, mx, txt, ns, cname, soa] = await Promise.allSettled([
+      dns.resolve4(domain).catch(() => null), // A Records
+      dns.resolve6(domain).catch(() => null), // AAAA Records
+      dns.resolveMx(domain).catch(() => null), // MX Records
+      dns.resolveTxt(domain).catch(() => null), // TXT Records
+      dns.resolveNs(domain).catch(() => null), // NS Records
+      dns.resolveCname(domain).catch(() => null), // CNAME Records
+      dns.resolveSoa(domain).catch(() => null)  // SOA Records
+    ]);
+
+    res.json({
+      domain,
+      records: {
+        A: a.value,
+        AAAA: aaaa.value,
+        MX: mx.value,
+        TXT: txt.value ? txt.value.flat() : null, // Flatten array of arrays
+        NS: ns.value,
+        CNAME: cname.value,
+        SOA: soa.value
+      }
+    });
+
+  } catch (error) {
+    // If the domain itself is invalid or completely unresolvable
+    res.status(500).json({ error: `DNS lookup failed: ${error.message}` });
+  }
+});
+
 
 
 
