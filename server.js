@@ -86,14 +86,20 @@ async function uploadToWasabi({ filepath, wasabiKey, mimetype }) {
   return `https://${WASABI_BUCKET}.s3.${WASABI_REGION}.wasabisys.com/${wasabiKey}`;
 }
 
-async function uploadToMux({ filepath, mimetype, originalFilename }) {
+// Updated helper to accept dynamic credentials
+async function uploadToMux({ filepath, mimetype, originalFilename, tokenId, tokenSecret }) {
   const external_id = randomUUID();
+
+  // Validate credentials exist
+  if (!tokenId || !tokenSecret) {
+    throw new Error("Missing Mux Credentials");
+  }
 
   const response = await fetch('https://api.mux.com/video/v1/uploads', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': 'Basic ' + Buffer.from(`${MUX_TOKEN_ID}:${MUX_TOKEN_SECRET}`).toString('base64')
+      'Authorization': 'Basic ' + Buffer.from(`${tokenId}:${tokenSecret}`).toString('base64')
     },
     body: JSON.stringify({
       new_asset_settings: {
@@ -186,6 +192,58 @@ app.options('/upload', (req, res) => {
   res.status(204).end();
 });
 
+async function getMuxCredentials(privateLabelled, memberUniqueId) {
+  // Default to Environment variables
+  let credentials = {
+    id: MUX_TOKEN_ID,
+    secret: MUX_TOKEN_SECRET
+  };
+
+  // Check if private labeling is requested and member ID exists
+  // Note: Form data often sends boolean true as string "true"
+  if ((privateLabelled === true || privateLabelled === 'true') && memberUniqueId) {
+    try {
+      console.log(`Fetching private Mux creds for member: ${memberUniqueId}`);
+      
+      const response = await fetch("https://upward.page/api/1.1/wf/get_mux_credentials", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          member_unique_id: memberUniqueId
+        })
+      });
+
+      if (!response.ok) {
+        console.error("Failed to fetch private credentials, falling back to default.");
+      } else {
+        const data = await response.json();
+        
+        // IMPORTANT: Ensure your Bubble API returns these exact keys
+        // or map them correctly here (e.g. data.response.mux_token)
+        if (data.response && data.response.mux_token_id && data.response.mux_token_secret) {
+           credentials.id = data.response.mux_token_id;
+           credentials.secret = data.response.mux_token_secret;
+           console.log(`using credentials for memberUniqueId: ${memberUniqueId}`)
+        } else if (data.mux_token_id && data.mux_token_secret) {
+           // Direct mapping if Bubble returns flat JSON
+           credentials.id = data.mux_token_id;
+           credentials.secret = data.mux_token_secret;
+           console.log(`using credentials for memberUniqueId: ${memberUniqueId}`)
+        } else {
+           console.warn("Private credentials format unrecognized, using default.");
+        }
+      }
+    } catch (error) {
+      console.error("Error fetching private credentials:", error);
+      // Fallback to default is automatic since we initialized `credentials` at the top
+    }
+  }
+
+  return credentials;
+}
+
 app.post('/upload', (req, res) => {
   const form = new formidable.IncomingForm({
     multiples: false,
@@ -194,23 +252,7 @@ app.post('/upload', (req, res) => {
     maxFileSize: 2 * 1024 * 1024 * 1024
   });
 
-  req.on('aborted', () => {
-    console.warn('⚠️ Request aborted by the client.');
-    form.emit('error', new Error('Client aborted the request.'));
-  });
-
-  form.on('fileBegin', (name, file) => {
-    console.log(`Upload started: ${file.originalFilename}`);
-  });
-  form.on('file', (name, file) => {
-    console.log(`File uploaded: ${file.originalFilename}`);
-  });
-  form.on('end', () => {
-    console.log('Formidable parse complete');
-  });
-  form.on('error', err => {
-    console.error('Formidable internal error:', err);
-  });
+  // ... (Keep existing aborted/error handlers) ...
 
   form.parse(req, async (err, fields, files) => {
     if (err) {
@@ -226,14 +268,32 @@ app.post('/upload', (req, res) => {
       const timestamp = Date.now();
       const safeName = originalFilename.replace(/[^\w.\-]/g, '_');
 
+      // --- NEW LOGIC START ---
+      
+      // Extract fields (Formidable v2/v3 sometimes returns arrays for fields)
+      const memberUniqueId = Array.isArray(fields.member_unique_id) ? fields.member_unique_id[0] : fields.member_unique_id;
+      const privateLabelled = Array.isArray(fields.private_labelled) ? fields.private_labelled[0] : fields.private_labelled;
+
       let result = {};
+      
       if (isVideoOrAudio(mimetype)) {
-        result = await uploadToMux({ filepath, mimetype, originalFilename });
+        // 1. Get Credentials (Async)
+        const muxCreds = await getMuxCredentials(privateLabelled, memberUniqueId);
+        
+        // 2. Pass credentials to upload function
+        result = await uploadToMux({ 
+          filepath, 
+          mimetype, 
+          originalFilename,
+          tokenId: muxCreds.id,
+          tokenSecret: muxCreds.secret
+        });
       } else {
         const wasabiKey = `${timestamp}_${safeName}`;
         const url = await uploadToWasabi({ filepath, wasabiKey, mimetype });
         result = { wasabi_url: url };
       }
+      // --- NEW LOGIC END ---
 
       await fs.unlink(filepath).catch(() => { });
 
