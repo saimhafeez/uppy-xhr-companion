@@ -58,17 +58,20 @@ const isVideoOrAudio = mimetype =>
 
 // ---- Streaming upload helpers
 
-async function uploadToWasabi({ filepath, wasabiKey, mimetype }) {
+async function uploadToWasabi({ filepath, wasabiKey, mimetype, wasabiConfig }) {
   const fileStream = fsSync.createReadStream(filepath);
+  
+  // Create specific client for this upload
+  const client = createS3Client(wasabiConfig);
 
   const command = new PutObjectCommand({
-    Bucket: WASABI_BUCKET,
+    Bucket: wasabiConfig.bucket,
     Key: wasabiKey,
     ContentType: mimetype || 'application/octet-stream',
     ACL: 'public-read'
   });
 
-  const url = await getSignedUrl(s3, command, { expiresIn: 600 });
+  const url = await getSignedUrl(client, command, { expiresIn: 600 });
 
   const resp = await fetch(url, {
     method: 'PUT',
@@ -83,7 +86,19 @@ async function uploadToWasabi({ filepath, wasabiKey, mimetype }) {
     const msg = await resp.text();
     throw new Error(`Wasabi PUT failed: ${resp.status} - ${msg}`);
   }
-  return `https://${WASABI_BUCKET}.s3.${WASABI_REGION}.wasabisys.com/${wasabiKey}`;
+  
+  // Construct URL based on the config endpoint/bucket
+  // Removing 'https://' from endpoint to construct standard path style if needed, 
+  // or just use standard Wasabi format if endpoint is standard.
+  // Defaulting to standard structure:
+  const regionStr = wasabiConfig.region ? `.${wasabiConfig.region}` : '';
+  // Check if endpoint is custom or standard wasabi
+  if (wasabiConfig.endpoint.includes('wasabisys.com')) {
+     return `https://${wasabiConfig.bucket}.s3${regionStr}.wasabisys.com/${wasabiKey}`;
+  } else {
+     // Fallback for custom endpoints (though Wasabi usually follows above)
+     return `${wasabiConfig.endpoint}/${wasabiConfig.bucket}/${wasabiKey}`;
+  }
 }
 
 async function uploadToMux({ filepath, mimetype, originalFilename, tokenId, tokenSecret }) {
@@ -241,6 +256,70 @@ async function getMuxCredentials(memberUniqueId) {
   return credentials;
 }
 
+async function getWasabiCredentials(memberUniqueId) {
+  // 1. Default Configuration
+  let config = {
+    bucket: process.env.WASABI_BUCKET,
+    region: process.env.WASABI_REGION,
+    endpoint: process.env.WASABI_ENDPOINT,
+    accessKeyId: process.env.WASABI_KEY,
+    secretAccessKey: process.env.WASABI_SECRET
+  };
+
+  if (!memberUniqueId) return config;
+
+  try {
+    // 2. Query API
+    const response = await fetch("https://upward.page/api/1.1/wf/get_wasabi_credentials", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ member_unique_id: memberUniqueId })
+    });
+
+    if (response.ok) {
+      const json = await response.json();
+      const data = json.response || json;
+
+      // 3. Check flag
+      const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
+
+      if (isPrivateLabelled) {
+        if (data.bucket_key && data.bucket_secret && data.bucket_name) {
+          config.bucket = data.bucket_name;
+          // Ensure endpoint has protocol
+          let ep = data.bucket_endpoint;
+          if (ep && !ep.startsWith('http')) ep = `https://${ep}`;
+          
+          config.endpoint = ep;
+          config.region = data.bucket_region;
+          config.accessKeyId = data.bucket_key;
+          config.secretAccessKey = data.bucket_secret;
+        } else {
+          console.warn(`[Wasabi Auth] Private Label requested for ${memberUniqueId} but keys missing. Using default.`);
+        }
+      }
+    }
+  } catch (error) {
+    console.error(`[Wasabi Auth] API check failed for ${memberUniqueId}:`, error.message);
+  }
+
+  return config;
+}
+
+// Helper to create a client based on specific credentials
+function createS3Client(config) {
+  return new S3Client({
+    endpoint: config.endpoint,
+    region: config.region,
+    credentials: {
+      accessKeyId: config.accessKeyId,
+      secretAccessKey: config.secretAccessKey
+    },
+    forcePathStyle: true
+  });
+}
+
+
 app.post('/upload', (req, res) => {
   const form = new formidable.IncomingForm({
     multiples: false,
@@ -249,11 +328,10 @@ app.post('/upload', (req, res) => {
     maxFileSize: 2 * 1024 * 1024 * 1024
   });
 
-  req.on('aborted', () => { /* ... existing code ... */ });
-  // ... existing logging handlers ...
+  req.on('aborted', () => { /* ... */ });
 
   form.parse(req, async (err, fields, files) => {
-    if (err) { /* ... existing error handling ... */ return; }
+    if (err) { /* ... handle error ... */ return; }
     
     try {
       const uploaded = (files.file && files.file[0]) || files[Object.keys(files)[0]][0];
@@ -261,8 +339,7 @@ app.post('/upload', (req, res) => {
       const timestamp = Date.now();
       const safeName = originalFilename.replace(/[^\w.\-]/g, '_');
 
-      // 1. Extract Member ID from Form Data
-      // Formidable might return it as a string or an array depending on version/input
+      // 1. Extract Member ID
       const memberUniqueId = Array.isArray(fields.member_unique_id) 
         ? fields.member_unique_id[0] 
         : fields.member_unique_id;
@@ -270,20 +347,27 @@ app.post('/upload', (req, res) => {
       let result = {};
       
       if (isVideoOrAudio(mimetype)) {
-        // 2. Determine Credentials (Always call API)
+        // --- MUX LOGIC ---
         const muxCreds = await getMuxCredentials(memberUniqueId);
-
-        // 3. Upload with determined credentials
         result = await uploadToMux({ 
           filepath, 
           mimetype, 
           originalFilename,
-          tokenId: muxCreds.id,       // Passed explicitly
-          tokenSecret: muxCreds.secret // Passed explicitly
+          tokenId: muxCreds.id,
+          tokenSecret: muxCreds.secret
         });
       } else {
+        // --- WASABI LOGIC ---
+        const wasabiConfig = await getWasabiCredentials(memberUniqueId);
         const wasabiKey = `${timestamp}_${safeName}`;
-        const url = await uploadToWasabi({ filepath, wasabiKey, mimetype });
+        
+        // Pass the dynamic config
+        const url = await uploadToWasabi({ 
+          filepath, 
+          wasabiKey, 
+          mimetype, 
+          wasabiConfig 
+        });
         result = { wasabi_url: url };
       }
 
@@ -315,40 +399,51 @@ app.options('/wasabi_presign_upload', (req, res) => {
 });
 
 app.post('/wasabi_presign_upload', express.json(), async (req, res) => {
-  //if (req.get('Origin') !== 'https://upward.page') {
-  //  return res.status(403).json({ error: 'Origin not allowed.' });
-  //}
-
-  const { file_name, folder_structure, mimetype } = req.body;
+  // Extract member_unique_id from body
+  const { file_name, folder_structure, mimetype, member_unique_id } = req.body;
+  
   if (!file_name || typeof file_name !== "string" || !folder_structure || typeof folder_structure !== "string") {
     return res.status(400).json({ error: 'file_name and folder_structure required' });
   }
 
-  // Normalize folder_structure (remove leading slash, ensure trailing slash if present)
+  // Get Dynamic Credentials
+  const wasabiConfig = await getWasabiCredentials(member_unique_id);
+  
+  // Create Dynamic Client
+  const client = createS3Client(wasabiConfig);
+
   let folder = folder_structure.replace(/^\/+/, '');
   if (folder && !folder.endsWith('/')) folder += '/';
 
-  // S3/Wasabi key
   const key = `${folder}${file_name}`;
   const contentType = mimetype || 'application/octet-stream';
 
   const command = new PutObjectCommand({
-    Bucket: WASABI_BUCKET,
+    Bucket: wasabiConfig.bucket,
     Key: key,
     ContentType: contentType,
     ACL: 'public-read'
   });
 
   try {
-    const uploadUrl = await getSignedUrl(s3, command, { expiresIn: 300 });
-    const fileUrl = `https://${WASABI_BUCKET}.s3.${WASABI_REGION}.wasabisys.com/${key}`;
+    const uploadUrl = await getSignedUrl(client, command, { expiresIn: 300 });
+    
+    // Construct File URL dynamically based on the bucket used
+    const regionStr = wasabiConfig.region ? `.${wasabiConfig.region}` : '';
+    let fileUrl;
+    
+    if (wasabiConfig.endpoint.includes('wasabisys.com')) {
+       fileUrl = `https://${wasabiConfig.bucket}.s3${regionStr}.wasabisys.com/${key}`;
+    } else {
+       fileUrl = `${wasabiConfig.endpoint}/${wasabiConfig.bucket}/${key}`;
+    }
 
     res.set('Access-Control-Allow-Origin', '*');
     res.json({ uploadUrl, fileUrl });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
-})
+});
 ///////////////////////////////////////////////////
 ///////////    Google Calendar    /////////////////
 ///////////////////////////////////////////////////
