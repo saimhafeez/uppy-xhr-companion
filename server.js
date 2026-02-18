@@ -1333,7 +1333,8 @@ const ipx = createIPX({
     domains: [
       "upward.s3.us-east-2.wasabisys.com",
       "aa70287ff58ea68c3f5d2d6e98c40119.cdn.bubble.io",
-      "s3.us-east-2.wasabisys.com"
+      "s3.us-east-2.wasabisys.com",
+      "1house.info"
       // ,"another-allowed-remote-host.com"
     ]
     // You can also use a RegExp/string for wildcards if needed, but restrict as much as possible for security!
