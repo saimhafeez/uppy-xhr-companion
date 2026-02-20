@@ -905,21 +905,22 @@ app.get('/login/tokeninfo/outlook', (req, res) => {
 ///////////////////////////////////////////////////
 
 const CONFIG_ZOOM = {
-  // These serve as defaults if no private label is found
+  // These serve as defaults
   DEFAULT_CLIENT_ID: process.env.ZOOM_CLIENT_ID,
   DEFAULT_CLIENT_SECRET: process.env.ZOOM_CLIENT_SECRET,
-  REDIRECT_URI: `https://${process.env.COMPANION_DOMAIN}/login/zoom/callback`,
+  DEFAULT_DOMAIN: process.env.COMPANION_DOMAIN, // e.g., services.upward.page
   JWT_SECRET: process.env.COMPANION_SECRET,
   TOKEN_EXPIRY: '5m',
-  COOKIE_NAME: 'zoom_auth_state',
-  COMPANION_DOMAIN: `https://${process.env.COMPANION_DOMAIN}`
+  COOKIE_NAME: 'zoom_auth_state'
 };
 
-// Helper: Get Dynamic Zoom Credentials
+// Helper: Get Dynamic Zoom Credentials & Domain
 async function getZoomCredentials(memberUniqueId) {
   let credentials = {
     clientId: CONFIG_ZOOM.DEFAULT_CLIENT_ID,
-    clientSecret: CONFIG_ZOOM.DEFAULT_CLIENT_SECRET
+    clientSecret: CONFIG_ZOOM.DEFAULT_CLIENT_SECRET,
+    // Default redirect URI based on env domain
+    redirectUri: `https://${CONFIG_ZOOM.DEFAULT_DOMAIN}/login/zoom/callback`
   };
 
   if (!memberUniqueId) return credentials;
@@ -928,20 +929,26 @@ async function getZoomCredentials(memberUniqueId) {
     const response = await fetch("https://upward.page/api/1.1/wf/get_zoom_credentials", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ member: memberUniqueId }) // Prompt specified key "member"
+      body: JSON.stringify({ member: memberUniqueId })
     });
 
     if (response.ok) {
       const json = await response.json();
       const data = json.response || json;
 
-      // Check if private labelled
       const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
 
       if (isPrivateLabelled) {
         if (data.zoom_client_id && data.zoom_client_secret) {
           credentials.clientId = data.zoom_client_id;
           credentials.clientSecret = data.zoom_client_secret;
+        }
+        
+        // Check for dynamic domain
+        if (data.companion_domain) {
+           // Ensure no protocol is included in the DB field, or strip it if present
+           let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+           credentials.redirectUri = `https://${cleanDomain}/login/zoom/callback`;
         }
       }
     }
@@ -953,14 +960,11 @@ async function getZoomCredentials(memberUniqueId) {
 }
 
 // STATE TOKEN GENERATION/VERIFY
-// Updated to include member_unique_id in the payload
 function generateZoomStateToken(origin, memberUniqueId) {
   return jwt.sign({ origin, memberUniqueId }, CONFIG_ZOOM.JWT_SECRET, { expiresIn: CONFIG_ZOOM.TOKEN_EXPIRY });
 }
-
 function verifyZoomStateToken(token) {
   try {
-    // Returns full decoded object { origin, memberUniqueId } or null
     return jwt.verify(token, CONFIG_ZOOM.JWT_SECRET);
   } catch (err) {
     return null;
@@ -969,13 +973,13 @@ function verifyZoomStateToken(token) {
 
 // STEP 1: Start OAuth
 app.get('/login/zoom', async (req, res) => {
-  const { origin, member_unique_id } = req.query; // Get member_unique_id from frontend
+  const { origin, member_unique_id } = req.query;
   if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
 
-  // 1. Fetch Credentials (to get the correct Client ID for the URL)
+  // 1. Fetch Credentials + Dynamic Redirect URI
   const creds = await getZoomCredentials(member_unique_id);
 
-  // 2. Encode member_unique_id into state so we have it on callback
+  // 2. Encode member_unique_id into state
   const stateToken = generateZoomStateToken(origin, member_unique_id);
 
   res.cookie(CONFIG_ZOOM.COOKIE_NAME, stateToken, {
@@ -988,7 +992,8 @@ app.get('/login/zoom', async (req, res) => {
   const authorizeUrl = `https://zoom.us/oauth/authorize?` +
     `response_type=code` +
     `&client_id=${encodeURIComponent(creds.clientId)}` +
-    `&redirect_uri=${encodeURIComponent(CONFIG_ZOOM.REDIRECT_URI)}` +
+    // USE THE DYNAMIC REDIRECT URI HERE
+    `&redirect_uri=${encodeURIComponent(creds.redirectUri)}` +
     `&state=${encodeURIComponent(stateToken)}`;
 
   res.redirect(authorizeUrl);
@@ -999,7 +1004,6 @@ app.get('/login/zoom/callback', async (req, res) => {
   const { code, state, error, error_description } = req.query;
   const cookieState = req.cookies[CONFIG_ZOOM.COOKIE_NAME];
   
-  // Verify cookie state
   const decodedState = verifyZoomStateToken(cookieState);
   res.clearCookie(CONFIG_ZOOM.COOKIE_NAME);
 
@@ -1010,7 +1014,7 @@ app.get('/login/zoom/callback', async (req, res) => {
   const origin = decodedState.origin;
   const memberUniqueId = decodedState.memberUniqueId;
 
-  // Verify returned state param (CSRF check)
+  // Verify returned state param
   if (state) {
     const checkState = verifyZoomStateToken(state);
     if (!checkState || checkState.origin !== origin) {
@@ -1039,14 +1043,14 @@ app.get('/login/zoom/callback', async (req, res) => {
   }
 
   try {
-    // 1. Fetch Credentials again using the ID from the state
+    // 1. Fetch Credentials + Dynamic Redirect URI again
     const creds = await getZoomCredentials(memberUniqueId);
 
-    // 2. Exchange code for token using dynamic creds
+    // 2. Exchange code for token
     const tokenEndpoint = 'https://zoom.us/oauth/token';
     const basicHeader = Buffer.from(`${creds.clientId}:${creds.clientSecret}`).toString('base64');
 
-    const tokenResp = await fetch(`${tokenEndpoint}?grant_type=authorization_code&code=${encodeURIComponent(code)}&redirect_uri=${encodeURIComponent(CONFIG_ZOOM.REDIRECT_URI)}`, {
+    const tokenResp = await fetch(`${tokenEndpoint}?grant_type=authorization_code&code=${encodeURIComponent(code)}&redirect_uri=${encodeURIComponent(creds.redirectUri)}`, {
       method: 'POST',
       headers: {
         'Authorization': `Basic ${basicHeader}`,
@@ -1066,15 +1070,13 @@ app.get('/login/zoom/callback', async (req, res) => {
     const refresh_token = tokenObj.refresh_token || null;
     const refresh_token_expires_in = tokenObj.refresh_token_expires_in || null;
 
-    // Try to fetch user email
+    // Fetch user info
     let email = null, name = null, picture = null;
     if (tokenObj.access_token) {
       try {
         const meResp = await fetch('https://api.zoom.us/v2/users/me', {
           method: 'GET',
-          headers: {
-            'Authorization': 'Bearer ' + tokenObj.access_token
-          }
+          headers: { 'Authorization': 'Bearer ' + tokenObj.access_token }
         });
         if (meResp.ok) {
           const meData = await meResp.json();
