@@ -900,14 +900,14 @@ app.get('/login/tokeninfo/outlook', (req, res) => {
 });
 
 
-
 ///////////////////////////////////////////////////
 ////////////            Zoom        ///////////////
 ///////////////////////////////////////////////////
 
 const CONFIG_ZOOM = {
-  CLIENT_ID: process.env.ZOOM_CLIENT_ID,
-  CLIENT_SECRET: process.env.ZOOM_CLIENT_SECRET,
+  // These serve as defaults if no private label is found
+  DEFAULT_CLIENT_ID: process.env.ZOOM_CLIENT_ID,
+  DEFAULT_CLIENT_SECRET: process.env.ZOOM_CLIENT_SECRET,
   REDIRECT_URI: `https://${process.env.COMPANION_DOMAIN}/login/zoom/callback`,
   JWT_SECRET: process.env.COMPANION_SECRET,
   TOKEN_EXPIRY: '5m',
@@ -915,25 +915,68 @@ const CONFIG_ZOOM = {
   COMPANION_DOMAIN: `https://${process.env.COMPANION_DOMAIN}`
 };
 
-// STATE TOKEN GENERATION/VERIFY
-function generateZoomStateToken(origin) {
-  return jwt.sign({ origin }, CONFIG_ZOOM.JWT_SECRET, { expiresIn: CONFIG_ZOOM.TOKEN_EXPIRY });
+// Helper: Get Dynamic Zoom Credentials
+async function getZoomCredentials(memberUniqueId) {
+  let credentials = {
+    clientId: CONFIG_ZOOM.DEFAULT_CLIENT_ID,
+    clientSecret: CONFIG_ZOOM.DEFAULT_CLIENT_SECRET
+  };
+
+  if (!memberUniqueId) return credentials;
+
+  try {
+    const response = await fetch("https://upward.page/api/1.1/wf/get_zoom_credentials", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ member: memberUniqueId }) // Prompt specified key "member"
+    });
+
+    if (response.ok) {
+      const json = await response.json();
+      const data = json.response || json;
+
+      // Check if private labelled
+      const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
+
+      if (isPrivateLabelled) {
+        if (data.zoom_client_id && data.zoom_client_secret) {
+          credentials.clientId = data.zoom_client_id;
+          credentials.clientSecret = data.zoom_client_secret;
+        }
+      }
+    }
+  } catch (error) {
+    console.error(`[Zoom Auth] API check failed for ${memberUniqueId}:`, error.message);
+  }
+
+  return credentials;
 }
+
+// STATE TOKEN GENERATION/VERIFY
+// Updated to include member_unique_id in the payload
+function generateZoomStateToken(origin, memberUniqueId) {
+  return jwt.sign({ origin, memberUniqueId }, CONFIG_ZOOM.JWT_SECRET, { expiresIn: CONFIG_ZOOM.TOKEN_EXPIRY });
+}
+
 function verifyZoomStateToken(token) {
   try {
-    const decoded = jwt.verify(token, CONFIG_ZOOM.JWT_SECRET);
-    return decoded.origin;
+    // Returns full decoded object { origin, memberUniqueId } or null
+    return jwt.verify(token, CONFIG_ZOOM.JWT_SECRET);
   } catch (err) {
     return null;
   }
 }
 
 // STEP 1: Start OAuth
-app.get('/login/zoom', (req, res) => {
-  const { origin } = req.query;
+app.get('/login/zoom', async (req, res) => {
+  const { origin, member_unique_id } = req.query; // Get member_unique_id from frontend
   if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
 
-  const stateToken = generateZoomStateToken(origin);
+  // 1. Fetch Credentials (to get the correct Client ID for the URL)
+  const creds = await getZoomCredentials(member_unique_id);
+
+  // 2. Encode member_unique_id into state so we have it on callback
+  const stateToken = generateZoomStateToken(origin, member_unique_id);
 
   res.cookie(CONFIG_ZOOM.COOKIE_NAME, stateToken, {
     httpOnly: true,
@@ -944,9 +987,9 @@ app.get('/login/zoom', (req, res) => {
 
   const authorizeUrl = `https://zoom.us/oauth/authorize?` +
     `response_type=code` +
-    `&client_id=${encodeURIComponent(CONFIG_ZOOM.CLIENT_ID)}` +
+    `&client_id=${encodeURIComponent(creds.clientId)}` +
     `&redirect_uri=${encodeURIComponent(CONFIG_ZOOM.REDIRECT_URI)}` +
-    `&state=${encodeURIComponent(stateToken)}`; // Pass state
+    `&state=${encodeURIComponent(stateToken)}`;
 
   res.redirect(authorizeUrl);
 });
@@ -955,19 +998,25 @@ app.get('/login/zoom', (req, res) => {
 app.get('/login/zoom/callback', async (req, res) => {
   const { code, state, error, error_description } = req.query;
   const cookieState = req.cookies[CONFIG_ZOOM.COOKIE_NAME];
-  let origin = verifyZoomStateToken(cookieState);
+  
+  // Verify cookie state
+  const decodedState = verifyZoomStateToken(cookieState);
   res.clearCookie(CONFIG_ZOOM.COOKIE_NAME);
 
-  // If state param is present, verify it
-  if (state) {
-    // If malicious state, delete auth cookie and abort
-    const stateOrigin = verifyZoomStateToken(state);
-    if (!stateOrigin) {
-      return res.status(400).send('Invalid state token');
-    }
-    origin = stateOrigin;
+  if (!decodedState || !decodedState.origin) {
+    return res.status(400).send('Missing or invalid state token');
   }
-  if (!origin) return res.status(400).send('Missing state token');
+
+  const origin = decodedState.origin;
+  const memberUniqueId = decodedState.memberUniqueId;
+
+  // Verify returned state param (CSRF check)
+  if (state) {
+    const checkState = verifyZoomStateToken(state);
+    if (!checkState || checkState.origin !== origin) {
+      return res.status(400).send('Invalid state parameter');
+    }
+  }
 
   if (error) {
     const safeMsg = (error_description || error).replace(/'/g, "\\'");
@@ -975,7 +1024,6 @@ app.get('/login/zoom/callback', async (req, res) => {
       <!DOCTYPE html>
       <html>
       <head>
-        <title>Authentication Error</title>
         <script>
           window.opener && window.opener.postMessage({
             source: 'companion-zoom-auth',
@@ -985,17 +1033,18 @@ app.get('/login/zoom/callback', async (req, res) => {
           window.close();
         </script>
       </head>
-      <body>
-        <p>Authentication failed. Closing window...</p>
-      </body>
+      <body><p>Authentication failed. Closing...</p></body>
       </html>
     `);
   }
 
   try {
-    // Exchange code for token
+    // 1. Fetch Credentials again using the ID from the state
+    const creds = await getZoomCredentials(memberUniqueId);
+
+    // 2. Exchange code for token using dynamic creds
     const tokenEndpoint = 'https://zoom.us/oauth/token';
-    const basicHeader = Buffer.from(`${CONFIG_ZOOM.CLIENT_ID}:${CONFIG_ZOOM.CLIENT_SECRET}`).toString('base64');
+    const basicHeader = Buffer.from(`${creds.clientId}:${creds.clientSecret}`).toString('base64');
 
     const tokenResp = await fetch(`${tokenEndpoint}?grant_type=authorization_code&code=${encodeURIComponent(code)}&redirect_uri=${encodeURIComponent(CONFIG_ZOOM.REDIRECT_URI)}`, {
       method: 'POST',
@@ -1003,7 +1052,6 @@ app.get('/login/zoom/callback', async (req, res) => {
         'Authorization': `Basic ${basicHeader}`,
         'Content-Type': 'application/x-www-form-urlencoded'
       }
-      // Body not needed for Zoom's API (params in URL)
     });
 
     const tokenRaw = await tokenResp.text();
@@ -1016,10 +1064,9 @@ app.get('/login/zoom/callback', async (req, res) => {
     }
 
     const refresh_token = tokenObj.refresh_token || null;
-    // Zoom tokens typically expire_in is access token validity (default 1h), but refresh tokens live 15 years or until revoked
-    const refresh_token_expires_in = tokenObj.refresh_token_expires_in || null; // Not always present
+    const refresh_token_expires_in = tokenObj.refresh_token_expires_in || null;
 
-    // Try to fetch user email (optional)
+    // Try to fetch user email
     let email = null, name = null, picture = null;
     if (tokenObj.access_token) {
       try {
@@ -1033,7 +1080,6 @@ app.get('/login/zoom/callback', async (req, res) => {
           const meData = await meResp.json();
           email = meData.email || null;
           name = meData.first_name && meData.last_name ? (meData.first_name + ' ' + meData.last_name) : (meData.first_name || meData.last_name) || meData.id || null;
-          // For Zoom, fetching a profile picture URL is not always possible (pro accounts)
           picture = meData.pic_url || null;
         }
       } catch (_) { }
@@ -1070,14 +1116,6 @@ app.get('/login/zoom/callback', async (req, res) => {
               document.getElementById('auto-close').style.display = 'none';
               document.getElementById('manual-close').style.display = 'block';
             }
-
-            window.addEventListener('beforeunload', function() {
-              if (window.opener && !window.opener.closed) {
-                window.opener.postMessage({
-                  source: source, loginToken: token, status: 'success'
-                }, targetOrigin);
-              }
-            });
           })();
         </script>
         <style>
@@ -1102,7 +1140,6 @@ app.get('/login/zoom/callback', async (req, res) => {
       <!DOCTYPE html>
       <html>
       <head>
-        <title>Authentication Error</title>
         <script>
           window.opener && window.opener.postMessage({
             source: 'companion-zoom-auth',
@@ -1112,15 +1149,13 @@ app.get('/login/zoom/callback', async (req, res) => {
           window.close();
         </script>
       </head>
-      <body>
-        <p>Authentication failed. Closing window...</p>
-      </body>
+      <body><p>Authentication failed. Closing window...</p></body>
       </html>
     `);
   }
 });
 
-// 3. Verify JWT issued above (used by Bubble plugin code)
+// 3. Verify JWT issued above
 app.get('/login/tokeninfo/zoom', (req, res) => {
   const { token } = req.query;
   if (!token) return res.status(400).json({ failed: true, error: 'Token is required' });
@@ -1143,7 +1178,6 @@ app.get('/login/tokeninfo/zoom', (req, res) => {
     res.status(401).json({ failed: true, error: 'Invalid or expired token' });
   }
 });
-
 
 /////////////////////////////////////////////////////
 ///////////     Google Analytics   /////////////////
