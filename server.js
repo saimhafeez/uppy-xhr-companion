@@ -1384,66 +1384,153 @@ app.use('/ipx', createIPXNodeServer(ipx));
 ///////////////////////////////////////////////////
 
 const CONFIG_GOOGLE_MEET = {
-  CLIENT_ID: process.env.GOOGLE_MEET_CLIENT_ID,
-  CLIENT_SECRET: process.env.GOOGLE_MEET_CLIENT_SECRET,
+  DEFAULT_CLIENT_ID: process.env.GOOGLE_MEET_CLIENT_ID,
+  DEFAULT_CLIENT_SECRET: process.env.GOOGLE_MEET_CLIENT_SECRET,
+  DEFAULT_DOMAIN: process.env.COMPANION_DOMAIN,
   JWT_SECRET: process.env.COMPANION_SECRET,
   TOKEN_EXPIRY: '5m',
   COOKIE_NAME: 'google_meet_auth_state',
-  COMPANION_DOMAIN: `https://${process.env.COMPANION_DOMAIN}`,
   SCOPES: [
     "https://www.googleapis.com/auth/meetings.space.created"
   ]
 };
 
-const meetOauth2Client = new google.auth.OAuth2(
-  CONFIG_GOOGLE_MEET.CLIENT_ID,
-  CONFIG_GOOGLE_MEET.CLIENT_SECRET,
-  `${CONFIG_GOOGLE_MEET.COMPANION_DOMAIN}/login/google/meet/callback`
-);
+// Helper: Get Dynamic Google Meet Credentials & Domain
+async function getGoogleMeetCredentials(memberUniqueId) {
+  let credentials = {
+    clientId: CONFIG_GOOGLE_MEET.DEFAULT_CLIENT_ID,
+    clientSecret: CONFIG_GOOGLE_MEET.DEFAULT_CLIENT_SECRET,
+    // Default redirect URI
+    redirectUri: `https://${CONFIG_GOOGLE_MEET.DEFAULT_DOMAIN}/login/google/meet/callback`
+  };
 
-function generateMeetStateToken(origin) {
-  return jwt.sign({ origin }, CONFIG_GOOGLE_MEET.JWT_SECRET, { expiresIn: CONFIG_GOOGLE_MEET.TOKEN_EXPIRY });
+  if (!memberUniqueId) return credentials;
+
+  try {
+    const response = await fetch("https://upward.page/api/1.1/wf/get_google_meet_credentials", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ member: memberUniqueId })
+    });
+
+    if (response.ok) {
+      const json = await response.json();
+      const data = json.response || json;
+
+      const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
+
+      if (isPrivateLabelled) {
+        if (data.client_id && data.client_secret) {
+          credentials.clientId = data.client_id;
+          credentials.clientSecret = data.client_secret;
+        }
+
+        if (data.companion_domain) {
+           let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+           credentials.redirectUri = `https://${cleanDomain}/login/google/meet/callback`;
+        }
+      }
+    }
+  } catch (error) {
+    console.error(`[Google Meet Auth] API check failed for ${memberUniqueId}:`, error.message);
+  }
+
+  return credentials;
+}
+
+// TOKEN UTILS
+function generateMeetStateToken(origin, memberUniqueId) {
+  return jwt.sign({ origin, memberUniqueId }, CONFIG_GOOGLE_MEET.JWT_SECRET, { expiresIn: CONFIG_GOOGLE_MEET.TOKEN_EXPIRY });
 }
 function verifyMeetStateToken(token) {
-  try {
-    const decoded = jwt.verify(token, CONFIG_GOOGLE_MEET.JWT_SECRET);
-    return decoded.origin;
-  } catch (err) {
-    return null;
-  }
+  try { return jwt.verify(token, CONFIG_GOOGLE_MEET.JWT_SECRET); } catch (err) { return null; }
 }
 
-app.get('/login/google/meet', (req, res) => {
-  const { origin } = req.query;
+// STEP 1: Start OAuth
+app.get('/login/google/meet', async (req, res) => {
+  const { origin, member_unique_id } = req.query;
   if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
 
-  const stateToken = generateMeetStateToken(origin);
+  // 1. Fetch Config to see where this user SHOULD be
+  const creds = await getGoogleMeetCredentials(member_unique_id);
+
+  // 2. CHECK DOMAIN MATCH (Pre-flight Redirect)
+  try {
+    const targetUrlObj = new URL(creds.redirectUri);
+    const targetHost = targetUrlObj.host; 
+    const currentHost = req.get('host');  
+
+    if (targetHost && currentHost && targetHost !== currentHost) {
+      const newStartUrl = `https://${targetHost}/login/google/meet?origin=${encodeURIComponent(origin)}&member_unique_id=${encodeURIComponent(member_unique_id)}`;
+      return res.redirect(newStartUrl);
+    }
+  } catch (e) {
+    console.error("Error checking domain match", e);
+  }
+
+  // 3. Generate State & Set Cookie
+  const stateToken = generateMeetStateToken(origin, member_unique_id);
   res.cookie(CONFIG_GOOGLE_MEET.COOKIE_NAME, stateToken, {
     httpOnly: true,
     secure: true,
     sameSite: 'none',
-    maxAge: 5 * 60 * 1000,
+    maxAge: 300000,
   });
 
-  const url = meetOauth2Client.generateAuthUrl({
+  // 4. Create Dynamic OAuth Client just for URL generation
+  const dynamicOauth2Client = new google.auth.OAuth2(
+    creds.clientId,
+    creds.clientSecret,
+    creds.redirectUri
+  );
+
+  const url = dynamicOauth2Client.generateAuthUrl({
     access_type: 'offline',
     prompt: 'consent',
     include_granted_scopes: false,
-    scope: CONFIG_GOOGLE_MEET.SCOPES
+    scope: CONFIG_GOOGLE_MEET.SCOPES,
+    state: stateToken // Pass state in URL for verification later? Google handles this differently but usually returns what we send.
+    // However, we rely on the COOKIE for the state verification in our flow, 
+    // but Google sometimes requires state in the URL to pass it back to callback.
+    // We didn't use state param in previous Google implementation, relying on cookie. 
+    // We will stick to cookie but adding state param to URL is harmless standard practice.
   });
+  
   res.redirect(url);
 });
 
+// STEP 2: Callback
 app.get('/login/google/meet/callback', async (req, res) => {
   const { code } = req.query;
   const stateToken = req.cookies[CONFIG_GOOGLE_MEET.COOKIE_NAME];
-  if (!stateToken) return res.status(400).send('Missing state token');
-  const origin = verifyMeetStateToken(stateToken);
-  if (!origin) return res.status(400).send('Invalid state token');
+  
+  const decodedState = verifyMeetStateToken(stateToken);
   res.clearCookie(CONFIG_GOOGLE_MEET.COOKIE_NAME);
 
+  if (!decodedState || !decodedState.origin) {
+     return res.status(400).send(`
+      <html><body>
+      <h3>Missing or invalid state token</h3>
+      <p>This usually happens if your browser blocks third-party cookies, or if the domain changed during login.</p>
+      </body></html>
+    `);
+  }
+  
+  const origin = decodedState.origin;
+  const memberUniqueId = decodedState.memberUniqueId;
+
   try {
-    const { tokens } = await meetOauth2Client.getToken(code);
+    // 1. Re-fetch Credentials (so we use the correct Client ID/Secret/RedirectURI)
+    const creds = await getGoogleMeetCredentials(memberUniqueId);
+
+    // 2. Create Client
+    const dynamicOauth2Client = new google.auth.OAuth2(
+      creds.clientId,
+      creds.clientSecret,
+      creds.redirectUri
+    );
+
+    const { tokens } = await dynamicOauth2Client.getToken(code);
 
     const refresh_token = tokens.refresh_token || null;
     const access_token = tokens.access_token || null;
@@ -1478,11 +1565,6 @@ app.get('/login/google/meet/callback', async (req, res) => {
               document.getElementById('auto-close').style.display = 'none';
               document.getElementById('manual-close').style.display = 'block';
             }
-            window.addEventListener('beforeunload', function() {
-              if (window.opener && !window.opener.closed) {
-                window.opener.postMessage({ source, loginToken: token, status: 'success' }, targetOrigin);
-              }
-            });
           })();
         </script>
         <style>
@@ -1502,6 +1584,7 @@ app.get('/login/google/meet/callback', async (req, res) => {
     `);
   } catch (error) {
     const safeMsg = ('' + error.message).replace(/'/g, "\\'");
+    console.error("Google Meet callback error:", error);
     res.send(`
       <!DOCTYPE html>
       <html>
