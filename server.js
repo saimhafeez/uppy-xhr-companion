@@ -444,6 +444,9 @@ app.post('/wasabi_presign_upload', express.json(), async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+
+
 ///////////////////////////////////////////////////
 ///////////    Google Calendar    /////////////////
 ///////////////////////////////////////////////////
@@ -451,43 +454,98 @@ app.post('/wasabi_presign_upload', express.json(), async (req, res) => {
 // ==== CONFIGURATION ====
 
 const CONFIG_GOOGLE_CALENDAR = {
-  CLIENT_ID: process.env.GOOGLE_CALENDAR_CLIENT_ID,
-  CLIENT_SECRET: process.env.GOOGLE_CALENDAR_CLIENT_SECRET,
+  DEFAULT_CLIENT_ID: process.env.GOOGLE_CALENDAR_CLIENT_ID,
+  DEFAULT_CLIENT_SECRET: process.env.GOOGLE_CALENDAR_CLIENT_SECRET,
+  DEFAULT_DOMAIN: process.env.COMPANION_DOMAIN,
   JWT_SECRET: process.env.COMPANION_SECRET,
   TOKEN_EXPIRY: '5m',
   COOKIE_NAME: 'google_auth_state',
-  COMPANION_DOMAIN: `https://${process.env.COMPANION_DOMAIN}`,
   SCOPES: [
     'https://www.googleapis.com/auth/calendar'
   ]
 };
 
-// ==== GOOGLE OAUTH2 CLIENT ====
-const oauth2Client = new google.auth.OAuth2(
-  CONFIG_GOOGLE_CALENDAR.CLIENT_ID,
-  CONFIG_GOOGLE_CALENDAR.CLIENT_SECRET,
-  `${CONFIG_GOOGLE_CALENDAR.COMPANION_DOMAIN}/login/google/callback`
-);
+// Helper: Get Dynamic Google Calendar Credentials & Domain
+async function getGoogleCalendarCredentials(memberUniqueId) {
+  let credentials = {
+    clientId: CONFIG_GOOGLE_CALENDAR.DEFAULT_CLIENT_ID,
+    clientSecret: CONFIG_GOOGLE_CALENDAR.DEFAULT_CLIENT_SECRET,
+    // Default redirect URI
+    redirectUri: `https://${CONFIG_GOOGLE_CALENDAR.DEFAULT_DOMAIN}/login/google/callback`
+  };
+
+  if (!memberUniqueId) return credentials;
+
+  try {
+    // Note: Assuming the API endpoint follows the naming convention
+    const response = await fetch("https://upward.page/api/1.1/wf/get_google_calendar_credentials", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ member: memberUniqueId })
+    });
+
+    if (response.ok) {
+      const json = await response.json();
+      const data = json.response || json;
+
+      const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
+
+      if (isPrivateLabelled) {
+        if (data.client_id && data.client_secret) {
+          credentials.clientId = data.client_id;
+          credentials.clientSecret = data.client_secret;
+        }
+
+        if (data.companion_domain) {
+           let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+           credentials.redirectUri = `https://${cleanDomain}/login/google/callback`;
+        }
+      }
+    }
+  } catch (error) {
+    console.error(`[Google Calendar Auth] API check failed for ${memberUniqueId}:`, error.message);
+  }
+
+  return credentials;
+}
 
 // ==== STATE UTILS ====
-function generateStateToken(origin) {
-  return jwt.sign({ origin }, CONFIG_GOOGLE_CALENDAR.JWT_SECRET, { expiresIn: CONFIG_GOOGLE_CALENDAR.TOKEN_EXPIRY });
+function generateStateToken(origin, memberUniqueId) {
+  return jwt.sign({ origin, memberUniqueId }, CONFIG_GOOGLE_CALENDAR.JWT_SECRET, { expiresIn: CONFIG_GOOGLE_CALENDAR.TOKEN_EXPIRY });
 }
 function verifyStateToken(token) {
   try {
-    const decoded = jwt.verify(token, CONFIG_GOOGLE_CALENDAR.JWT_SECRET);
-    return decoded.origin;
+    // Returns { origin, memberUniqueId }
+    return jwt.verify(token, CONFIG_GOOGLE_CALENDAR.JWT_SECRET);
   } catch (err) {
     return null;
   }
 }
 
 // ==== LOGIN ENDPOINT ====
-app.get('/login/google/calendar', (req, res) => {
-  const { origin } = req.query;
+app.get('/login/google/calendar', async (req, res) => {
+  const { origin, member_unique_id } = req.query;
   if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
 
-  const stateToken = generateStateToken(origin);
+  // 1. Fetch Config to see where this user SHOULD be
+  const creds = await getGoogleCalendarCredentials(member_unique_id);
+
+  // 2. CHECK DOMAIN MATCH (Pre-flight Redirect)
+  try {
+    const targetUrlObj = new URL(creds.redirectUri);
+    const targetHost = targetUrlObj.host; 
+    const currentHost = req.get('host');  
+
+    if (targetHost && currentHost && targetHost !== currentHost) {
+      const newStartUrl = `https://${targetHost}/login/google/calendar?origin=${encodeURIComponent(origin)}&member_unique_id=${encodeURIComponent(member_unique_id)}`;
+      return res.redirect(newStartUrl);
+    }
+  } catch (e) {
+    console.error("Error checking domain match", e);
+  }
+
+  // 3. Generate State & Set Cookie
+  const stateToken = generateStateToken(origin, member_unique_id);
   res.cookie(CONFIG_GOOGLE_CALENDAR.COOKIE_NAME, stateToken, {
     httpOnly: true,
     secure: true,
@@ -495,7 +553,14 @@ app.get('/login/google/calendar', (req, res) => {
     maxAge: 5 * 60 * 1000 // 5 minutes
   });
 
-  const url = oauth2Client.generateAuthUrl({
+  // 4. Create Dynamic OAuth Client
+  const dynamicOauth2Client = new google.auth.OAuth2(
+    creds.clientId,
+    creds.clientSecret,
+    creds.redirectUri
+  );
+
+  const url = dynamicOauth2Client.generateAuthUrl({
     access_type: 'offline',
     prompt: 'consent',
     include_granted_scopes: false,
@@ -508,13 +573,34 @@ app.get('/login/google/calendar', (req, res) => {
 app.get('/login/google/callback', async (req, res) => {
   const { code } = req.query;
   const stateToken = req.cookies[CONFIG_GOOGLE_CALENDAR.COOKIE_NAME];
-  if (!stateToken) return res.status(400).send('Missing state token');
-  const origin = verifyStateToken(stateToken);
-  if (!origin) return res.status(400).send('Invalid state token');
+  
+  const decodedState = verifyStateToken(stateToken);
   res.clearCookie(CONFIG_GOOGLE_CALENDAR.COOKIE_NAME);
 
+  if (!decodedState || !decodedState.origin) {
+    return res.status(400).send(`
+      <html><body>
+      <h3>Missing or invalid state token</h3>
+      <p>This usually happens if your browser blocks third-party cookies, or if the domain changed during login.</p>
+      </body></html>
+    `);
+  }
+
+  const origin = decodedState.origin;
+  const memberUniqueId = decodedState.memberUniqueId;
+
   try {
-    const { tokens } = await oauth2Client.getToken(code);
+    // 1. Re-fetch Credentials
+    const creds = await getGoogleCalendarCredentials(memberUniqueId);
+
+    // 2. Create Dynamic Client
+    const dynamicOauth2Client = new google.auth.OAuth2(
+      creds.clientId,
+      creds.clientSecret,
+      creds.redirectUri
+    );
+
+    const { tokens } = await dynamicOauth2Client.getToken(code);
 
     const refresh_token = tokens.refresh_token || null;
     const access_token = tokens.access_token || null;
@@ -556,12 +642,6 @@ app.get('/login/google/callback', async (req, res) => {
               document.getElementById('auto-close').style.display = 'none';
               document.getElementById('manual-close').style.display = 'block';
             }
-
-            window.addEventListener('beforeunload', function() {
-              if (window.opener && !window.opener.closed) {
-                window.opener.postMessage({ source: source, loginToken: token, status: 'success' }, targetOrigin);
-              }
-            });
           })();
         </script>
         <style>
