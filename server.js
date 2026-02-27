@@ -1261,48 +1261,103 @@ app.get('/login/tokeninfo/zoom', (req, res) => {
   }
 });
 
+
 /////////////////////////////////////////////////////
 ///////////     Google Analytics   /////////////////
 ////////////////////////////////////////////////////
 
 const CONFIG_GOOGLE_ANALYTICS = {
-  CLIENT_ID: process.env.GOOGLE_ANALYTICS_CLIENT_ID,
-  CLIENT_SECRET: process.env.GOOGLE_ANALYTICS_CLIENT_SECRET,
+  DEFAULT_CLIENT_ID: process.env.GOOGLE_ANALYTICS_CLIENT_ID,
+  DEFAULT_CLIENT_SECRET: process.env.GOOGLE_ANALYTICS_CLIENT_SECRET,
+  DEFAULT_DOMAIN: process.env.COMPANION_DOMAIN,
   JWT_SECRET: process.env.COMPANION_SECRET,
   TOKEN_EXPIRY: '5m',
   COOKIE_NAME: 'google_analytics_auth_state',
-  COMPANION_DOMAIN: `https://${process.env.COMPANION_DOMAIN}`,
   SCOPES: [
-    // Only what's required for Analytics property/datastream management
     "https://www.googleapis.com/auth/analytics.edit",
     "https://www.googleapis.com/auth/analytics.readonly"
   ]
 };
 
-const analyticsOAuth2Client = new google.auth.OAuth2(
-  CONFIG_GOOGLE_ANALYTICS.CLIENT_ID,
-  CONFIG_GOOGLE_ANALYTICS.CLIENT_SECRET,
-  `${CONFIG_GOOGLE_ANALYTICS.COMPANION_DOMAIN}/login/google-analytics/callback`
-);
+// Helper: Get Dynamic Google Analytics Credentials & Domain
+async function getGoogleAnalyticsCredentials(memberUniqueId) {
+  let credentials = {
+    clientId: CONFIG_GOOGLE_ANALYTICS.DEFAULT_CLIENT_ID,
+    clientSecret: CONFIG_GOOGLE_ANALYTICS.DEFAULT_CLIENT_SECRET,
+    // Default redirect URI
+    redirectUri: `https://${CONFIG_GOOGLE_ANALYTICS.DEFAULT_DOMAIN}/login/google-analytics/callback`
+  };
 
-function generateAnalyticsStateToken(origin) {
-  return jwt.sign({ origin }, CONFIG_GOOGLE_ANALYTICS.JWT_SECRET, { expiresIn: CONFIG_GOOGLE_ANALYTICS.TOKEN_EXPIRY });
+  if (!memberUniqueId) return credentials;
+
+  try {
+    const response = await fetch("https://upward.page/api/1.1/wf/get_google_analytics_credentials", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ member: memberUniqueId })
+    });
+
+    if (response.ok) {
+      const json = await response.json();
+      const data = json.response || json;
+
+      const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
+
+      if (isPrivateLabelled) {
+        if (data.client_id && data.client_secret) {
+          credentials.clientId = data.client_id;
+          credentials.clientSecret = data.client_secret;
+        }
+
+        if (data.companion_domain) {
+           let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+           credentials.redirectUri = `https://${cleanDomain}/login/google-analytics/callback`;
+        }
+      }
+    }
+  } catch (error) {
+    console.error(`[Google Analytics Auth] API check failed for ${memberUniqueId}:`, error.message);
+  }
+
+  return credentials;
+}
+
+// ==== STATE UTILS ====
+function generateAnalyticsStateToken(origin, memberUniqueId) {
+  return jwt.sign({ origin, memberUniqueId }, CONFIG_GOOGLE_ANALYTICS.JWT_SECRET, { expiresIn: CONFIG_GOOGLE_ANALYTICS.TOKEN_EXPIRY });
 }
 function verifyAnalyticsStateToken(token) {
   try {
-    const decoded = jwt.verify(token, CONFIG_GOOGLE_ANALYTICS.JWT_SECRET);
-    return decoded.origin;
+    return jwt.verify(token, CONFIG_GOOGLE_ANALYTICS.JWT_SECRET);
   } catch (e) {
     return null;
   }
 }
 
 // === OAUTH2 LOGIN ENDPOINT ===
-app.get('/login/google-analytics', (req, res) => {
-  const { origin } = req.query;
+app.get('/login/google-analytics', async (req, res) => {
+  const { origin, member_unique_id } = req.query;
   if (!origin) return res.status(400).json({ error: "Origin parameter is required" });
 
-  const stateToken = generateAnalyticsStateToken(origin);
+  // 1. Fetch Config
+  const creds = await getGoogleAnalyticsCredentials(member_unique_id);
+
+  // 2. CHECK DOMAIN MATCH (Pre-flight Redirect)
+  try {
+    const targetUrlObj = new URL(creds.redirectUri);
+    const targetHost = targetUrlObj.host; 
+    const currentHost = req.get('host');  
+
+    if (targetHost && currentHost && targetHost !== currentHost) {
+      const newStartUrl = `https://${targetHost}/login/google-analytics?origin=${encodeURIComponent(origin)}&member_unique_id=${encodeURIComponent(member_unique_id)}`;
+      return res.redirect(newStartUrl);
+    }
+  } catch (e) {
+    console.error("Error checking domain match", e);
+  }
+
+  // 3. Generate State & Set Cookie
+  const stateToken = generateAnalyticsStateToken(origin, member_unique_id);
   res.cookie(CONFIG_GOOGLE_ANALYTICS.COOKIE_NAME, stateToken, {
     httpOnly: true,
     secure: true,
@@ -1310,7 +1365,14 @@ app.get('/login/google-analytics', (req, res) => {
     maxAge: 5 * 60 * 1000 // 5 minutes
   });
 
-  const url = analyticsOAuth2Client.generateAuthUrl({
+  // 4. Create Dynamic OAuth Client
+  const dynamicOauth2Client = new google.auth.OAuth2(
+    creds.clientId,
+    creds.clientSecret,
+    creds.redirectUri
+  );
+
+  const url = dynamicOauth2Client.generateAuthUrl({
     access_type: 'offline',
     prompt: 'consent',
     include_granted_scopes: false,
@@ -1323,13 +1385,34 @@ app.get('/login/google-analytics', (req, res) => {
 app.get('/login/google-analytics/callback', async (req, res) => {
   const { code } = req.query;
   const stateToken = req.cookies[CONFIG_GOOGLE_ANALYTICS.COOKIE_NAME];
-  if (!stateToken) return res.status(400).send('Missing state token');
-  const origin = verifyAnalyticsStateToken(stateToken);
-  if (!origin) return res.status(400).send('Invalid state token');
+  
+  const decodedState = verifyAnalyticsStateToken(stateToken);
   res.clearCookie(CONFIG_GOOGLE_ANALYTICS.COOKIE_NAME);
 
+  if (!decodedState || !decodedState.origin) {
+    return res.status(400).send(`
+      <html><body>
+      <h3>Missing or invalid state token</h3>
+      <p>This usually happens if your browser blocks third-party cookies, or if the domain changed during login.</p>
+      </body></html>
+    `);
+  }
+
+  const origin = decodedState.origin;
+  const memberUniqueId = decodedState.memberUniqueId;
+
   try {
-    const { tokens } = await analyticsOAuth2Client.getToken(code);
+    // 1. Re-fetch Credentials
+    const creds = await getGoogleAnalyticsCredentials(memberUniqueId);
+
+    // 2. Create Dynamic Client
+    const dynamicOauth2Client = new google.auth.OAuth2(
+      creds.clientId,
+      creds.clientSecret,
+      creds.redirectUri
+    );
+
+    const { tokens } = await dynamicOauth2Client.getToken(code);
 
     const refresh_token = tokens.refresh_token || null;
     const access_token = tokens.access_token || null;
@@ -1371,12 +1454,6 @@ app.get('/login/google-analytics/callback', async (req, res) => {
               document.getElementById('auto-close').style.display = 'none';
               document.getElementById('manual-close').style.display = 'block';
             }
-
-            window.addEventListener('beforeunload', function() {
-              if (window.opener && !window.opener.closed) {
-                window.opener.postMessage({ source: source, loginToken: token, status: 'success' }, targetOrigin);
-              }
-            });
           })();
         </script>
         <style>
