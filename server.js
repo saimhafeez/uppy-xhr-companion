@@ -1793,41 +1793,93 @@ app.get('/login/tokeninfo/meet', (req, res) => {
 // ==== CONFIGURATION ====
 
 const CONFIG_GOOGLE_LOGIN = {
-  CLIENT_ID: process.env.GOOGLE_LOGIN_CLIENT_ID,
-  CLIENT_SECRET: process.env.GOOGLE_LOGIN_CLIENT_SECRET,
-  JWT_SECRET: process.env.COMPANION_SECRET, // or your own separate one
+  DEFAULT_CLIENT_ID: process.env.GOOGLE_LOGIN_CLIENT_ID,
+  DEFAULT_CLIENT_SECRET: process.env.GOOGLE_LOGIN_CLIENT_SECRET,
+  DEFAULT_DOMAIN: process.env.COMPANION_DOMAIN,
+  JWT_SECRET: process.env.COMPANION_SECRET, 
   TOKEN_EXPIRY: '2m',
-  COOKIE_NAME: 'google_login_state',
-  COMPANION_DOMAIN: `https://${process.env.COMPANION_DOMAIN}`,
-  ALLOWED_REDIRECT_PATHS: ['/'],
+  COOKIE_NAME: 'google_login_state'
 };
 
-// ==== GOOGLE OAUTH2 CLIENT ====
-const loginOauth2Client = new google.auth.OAuth2(
-  CONFIG_GOOGLE_LOGIN.CLIENT_ID,
-  CONFIG_GOOGLE_LOGIN.CLIENT_SECRET,
-  `${CONFIG_GOOGLE_LOGIN.COMPANION_DOMAIN}/login/google/oauth/callback`
-);
+// Helper: Get Dynamic Google Login Credentials & Domain
+async function getGoogleLoginCredentials(memberUniqueId) {
+  let credentials = {
+    clientId: CONFIG_GOOGLE_LOGIN.DEFAULT_CLIENT_ID,
+    clientSecret: CONFIG_GOOGLE_LOGIN.DEFAULT_CLIENT_SECRET,
+    // Default redirect URI
+    redirectUri: `https://${CONFIG_GOOGLE_LOGIN.DEFAULT_DOMAIN}/login/google/oauth/callback`
+  };
+
+  if (!memberUniqueId) return credentials;
+
+  try {
+    const response = await fetch("https://upward.page/api/1.1/wf/get_google_login_credentials", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ member: memberUniqueId })
+    });
+
+    if (response.ok) {
+      const json = await response.json();
+      const data = json.response || json;
+
+      const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
+
+      if (isPrivateLabelled) {
+        if (data.client_id && data.client_secret) {
+          credentials.clientId = data.client_id;
+          credentials.clientSecret = data.client_secret;
+        }
+
+        if (data.companion_domain) {
+           let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+           credentials.redirectUri = `https://${cleanDomain}/login/google/oauth/callback`;
+        }
+      }
+    }
+  } catch (error) {
+    console.error(`[Google Login Auth] API check failed for ${memberUniqueId}:`, error.message);
+  }
+
+  return credentials;
+}
 
 // ==== UTILITY FUNCTIONS ====
-function generateLoginStateToken(origin) {
-  return jwt.sign({ origin }, CONFIG_GOOGLE_LOGIN.JWT_SECRET, { expiresIn: CONFIG_GOOGLE_LOGIN.TOKEN_EXPIRY });
+function generateLoginStateToken(origin, memberUniqueId) {
+  return jwt.sign({ origin, memberUniqueId }, CONFIG_GOOGLE_LOGIN.JWT_SECRET, { expiresIn: CONFIG_GOOGLE_LOGIN.TOKEN_EXPIRY });
 }
 function verifyLoginStateToken(token) {
   try {
-    const decoded = jwt.verify(token, CONFIG_GOOGLE_LOGIN.JWT_SECRET);
-    return decoded.origin;
+    return jwt.verify(token, CONFIG_GOOGLE_LOGIN.JWT_SECRET);
   } catch (err) {
     return null;
   }
 }
 
 // ==== LOGIN: GOOGLE OAUTH FOR PROFILE ====
-app.get('/login/google/oauth', (req, res) => {
-  const { origin } = req.query;
+app.get('/login/google/oauth', async (req, res) => {
+  const { origin, member_unique_id } = req.query;
   if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
 
-  const stateToken = generateLoginStateToken(origin);
+  // 1. Fetch Config
+  const creds = await getGoogleLoginCredentials(member_unique_id);
+
+  // 2. CHECK DOMAIN MATCH (Pre-flight Redirect)
+  try {
+    const targetUrlObj = new URL(creds.redirectUri);
+    const targetHost = targetUrlObj.host; 
+    const currentHost = req.get('host');  
+
+    if (targetHost && currentHost && targetHost !== currentHost) {
+      const newStartUrl = `https://${targetHost}/login/google/oauth?origin=${encodeURIComponent(origin)}&member_unique_id=${encodeURIComponent(member_unique_id)}`;
+      return res.redirect(newStartUrl);
+    }
+  } catch (e) {
+    console.error("Error checking domain match", e);
+  }
+
+  // 3. Generate State & Set Cookie
+  const stateToken = generateLoginStateToken(origin, member_unique_id);
   res.cookie(CONFIG_GOOGLE_LOGIN.COOKIE_NAME, stateToken, {
     httpOnly: true,
     secure: true,
@@ -1835,9 +1887,16 @@ app.get('/login/google/oauth', (req, res) => {
     maxAge: 120000, // 2 min
   });
 
-  const url = loginOauth2Client.generateAuthUrl({
+  // 4. Create Dynamic OAuth Client
+  const dynamicOauth2Client = new google.auth.OAuth2(
+    creds.clientId,
+    creds.clientSecret,
+    creds.redirectUri
+  );
+
+  const url = dynamicOauth2Client.generateAuthUrl({
     access_type: 'online',
-    prompt: 'select_account', // or 'consent' if you want to always show
+    prompt: 'select_account',
     include_granted_scopes: true,
     scope: [
       'https://www.googleapis.com/auth/userinfo.email',
@@ -1851,16 +1910,37 @@ app.get('/login/google/oauth', (req, res) => {
 app.get('/login/google/oauth/callback', async (req, res) => {
   const { code } = req.query;
   const stateToken = req.cookies[CONFIG_GOOGLE_LOGIN.COOKIE_NAME];
-  if (!stateToken) return res.status(400).send('Missing state token');
-  const origin = verifyLoginStateToken(stateToken);
-  if (!origin) return res.status(400).send('Invalid state token');
+  
+  const decodedState = verifyLoginStateToken(stateToken);
   res.clearCookie(CONFIG_GOOGLE_LOGIN.COOKIE_NAME);
 
-  try {
-    const { tokens } = await loginOauth2Client.getToken(code);
-    loginOauth2Client.setCredentials(tokens);
+  if (!decodedState || !decodedState.origin) {
+    return res.status(400).send(`
+      <html><body>
+      <h3>Missing or invalid state token</h3>
+      <p>This usually happens if your browser blocks third-party cookies, or if the domain changed during login.</p>
+      </body></html>
+    `);
+  }
 
-    const oauth2 = google.oauth2({ version: 'v2', auth: loginOauth2Client });
+  const origin = decodedState.origin;
+  const memberUniqueId = decodedState.memberUniqueId;
+
+  try {
+    // 1. Re-fetch Credentials
+    const creds = await getGoogleLoginCredentials(memberUniqueId);
+
+    // 2. Create Dynamic Client
+    const dynamicOauth2Client = new google.auth.OAuth2(
+      creds.clientId,
+      creds.clientSecret,
+      creds.redirectUri
+    );
+
+    const { tokens } = await dynamicOauth2Client.getToken(code);
+    dynamicOauth2Client.setCredentials(tokens);
+
+    const oauth2 = google.oauth2({ version: 'v2', auth: dynamicOauth2Client });
     const { data } = await oauth2.userinfo.get();
 
     // Extract names (prefer given/family, fallback split)
