@@ -2398,43 +2398,105 @@ app.get('/login/tokeninfo/apple', (req, res) => {
 ///////////////////////////////////////////////////
 
 const CONFIG_LINKEDIN_LOGIN = {
-  CLIENT_ID: process.env.LINKEDIN_CLIENT_ID,
-  CLIENT_SECRET: process.env.LINKEDIN_CLIENT_SECRET,
+  DEFAULT_CLIENT_ID: process.env.LINKEDIN_CLIENT_ID,
+  DEFAULT_CLIENT_SECRET: process.env.LINKEDIN_CLIENT_SECRET,
+  DEFAULT_DOMAIN: process.env.COMPANION_DOMAIN,
   JWT_SECRET: process.env.COMPANION_SECRET,
   TOKEN_EXPIRY: '2m',
-  COOKIE_NAME: 'linkedin_login_state',
-  COMPANION_DOMAIN: `https://${process.env.COMPANION_DOMAIN}`
+  COOKIE_NAME: 'linkedin_login_state'
 };
 
-function generateLinkedinLoginStateToken(origin) {
-  return jwt.sign({ origin }, CONFIG_LINKEDIN_LOGIN.JWT_SECRET, { expiresIn: CONFIG_LINKEDIN_LOGIN.TOKEN_EXPIRY });
+// Helper: Get Dynamic LinkedIn Login Credentials & Domain
+async function getLinkedinLoginCredentials(memberUniqueId) {
+  let credentials = {
+    clientId: CONFIG_LINKEDIN_LOGIN.DEFAULT_CLIENT_ID,
+    clientSecret: CONFIG_LINKEDIN_LOGIN.DEFAULT_CLIENT_SECRET,
+    // Default redirect URI
+    redirectUri: `https://${CONFIG_LINKEDIN_LOGIN.DEFAULT_DOMAIN}/login/linkedin/callback`
+  };
+
+  if (!memberUniqueId) return credentials;
+
+  try {
+    const response = await fetch("https://upward.page/api/1.1/wf/get_linkedin_login_credentials", {
+      method: "POST",
+      headers: { 
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
+      },
+      body: JSON.stringify({ member: memberUniqueId })
+    });
+
+    if (response.ok) {
+      const json = await response.json();
+      const data = json.response || json;
+
+      const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
+
+      if (isPrivateLabelled) {
+        if (data.client_id && data.client_secret) {
+          credentials.clientId = data.client_id;
+          credentials.clientSecret = data.client_secret;
+        }
+
+        if (data.companion_domain) {
+           let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+           credentials.redirectUri = `https://${cleanDomain}/login/linkedin/callback`;
+        }
+      }
+    }
+  } catch (error) {
+    console.error(`[LinkedIn Login Auth] API check failed for ${memberUniqueId}:`, error.message);
+  }
+
+  return credentials;
+}
+
+// ==== State Token Utils ====
+function generateLinkedinLoginStateToken(origin, memberUniqueId) {
+  return jwt.sign({ origin, memberUniqueId }, CONFIG_LINKEDIN_LOGIN.JWT_SECRET, { expiresIn: CONFIG_LINKEDIN_LOGIN.TOKEN_EXPIRY });
 }
 function verifyLinkedinLoginStateToken(token) {
   try {
-    const decoded = jwt.verify(token, CONFIG_LINKEDIN_LOGIN.JWT_SECRET);
-    return decoded.origin;
+    return jwt.verify(token, CONFIG_LINKEDIN_LOGIN.JWT_SECRET);
   } catch {
     return null;
   }
 }
 
 // ==== 1. Kick off login ====
-app.get('/login/linkedin/oauth', (req, res) => {
-  const { origin } = req.query;
+app.get('/login/linkedin/oauth', async (req, res) => {
+  const { origin, member_unique_id } = req.query;
   if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
 
-  const stateToken = generateLinkedinLoginStateToken(origin);
+  // 1. Fetch Config
+  const creds = await getLinkedinLoginCredentials(member_unique_id);
+
+  // 2. CHECK DOMAIN MATCH (Pre-flight Redirect)
+  try {
+    const targetUrlObj = new URL(creds.redirectUri);
+    const targetHost = targetUrlObj.host; 
+    const currentHost = req.get('host');  
+
+    if (targetHost && currentHost && targetHost !== currentHost) {
+      const newStartUrl = `https://${targetHost}/login/linkedin/oauth?origin=${encodeURIComponent(origin)}&member_unique_id=${encodeURIComponent(member_unique_id)}`;
+      return res.redirect(newStartUrl);
+    }
+  } catch (e) {
+    console.error("Error checking domain match", e);
+  }
+
+  // 3. Generate State & Set Cookie
+  const stateToken = generateLinkedinLoginStateToken(origin, member_unique_id);
   res.cookie(CONFIG_LINKEDIN_LOGIN.COOKIE_NAME, stateToken, {
     httpOnly: true, secure: true, sameSite: 'none', maxAge: 120000
   });
 
-  const redirect_uri = `${CONFIG_LINKEDIN_LOGIN.COMPANION_DOMAIN}/login/linkedin/callback`;
-
   const params = new URLSearchParams({
     response_type: 'code',
-    client_id: CONFIG_LINKEDIN_LOGIN.CLIENT_ID,
-    redirect_uri,
-    state: 'linkedin-login',
+    client_id: creds.clientId,
+    redirect_uri: creds.redirectUri,
+    state: 'linkedin-login', // LinkedIn requires this for CSRF, though we use cookie + JWT for our own verification
     scope: 'openid email profile'
   });
 
@@ -2445,21 +2507,33 @@ app.get('/login/linkedin/oauth', (req, res) => {
 app.get('/login/linkedin/callback', async (req, res) => {
   const { code } = req.query;
   const stateToken = req.cookies[CONFIG_LINKEDIN_LOGIN.COOKIE_NAME];
-  if (!stateToken) return res.status(400).send('Missing state token');
-  const origin = verifyLinkedinLoginStateToken(stateToken);
-  if (!origin) return res.status(400).send('Invalid state token');
+  
+  const decodedState = verifyLinkedinLoginStateToken(stateToken);
   res.clearCookie(CONFIG_LINKEDIN_LOGIN.COOKIE_NAME);
 
-  try {
-    // 1. Exchange code for access_token & id_token
-    const redirect_uri = `${CONFIG_LINKEDIN_LOGIN.COMPANION_DOMAIN}/login/linkedin/callback`;
+  if (!decodedState || !decodedState.origin) {
+    return res.status(400).send(`
+      <html><body>
+      <h3>Missing or invalid state token</h3>
+      <p>This usually happens if your browser blocks third-party cookies, or if the domain changed during login.</p>
+      </body></html>
+    `);
+  }
 
+  const origin = decodedState.origin;
+  const memberUniqueId = decodedState.memberUniqueId;
+
+  try {
+    // 1. Re-fetch Credentials (to get correct client_id/secret/redirect_uri)
+    const creds = await getLinkedinLoginCredentials(memberUniqueId);
+
+    // 2. Exchange code for access_token & id_token
     const tokenResp = await axios.post('https://www.linkedin.com/oauth/v2/accessToken', new URLSearchParams({
       grant_type: 'authorization_code',
       code,
-      redirect_uri,
-      client_id: CONFIG_LINKEDIN_LOGIN.CLIENT_ID,
-      client_secret: CONFIG_LINKEDIN_LOGIN.CLIENT_SECRET
+      redirect_uri: creds.redirectUri,
+      client_id: creds.clientId,
+      client_secret: creds.clientSecret
     }).toString(), {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
     });
@@ -2467,7 +2541,7 @@ app.get('/login/linkedin/callback', async (req, res) => {
     const access_token = tokenResp.data.access_token;
     const id_token = tokenResp.data.id_token;
 
-    // 2. Decode the id_token JWT for name/email/profile
+    // 3. Decode the id_token JWT for name/email/profile
     let first_name = "", last_name = "", email = "", picture = null;
     if (id_token) {
       try {
@@ -2486,7 +2560,6 @@ app.get('/login/linkedin/callback', async (req, res) => {
     // If fallback, still get legacy info per old method:
     if (!first_name || !last_name || !email) {
       try {
-        // r_liteprofile, r_emailaddress are still allowed together with openid
         const [profileResp, emailResp] = await Promise.all([
           axios.get('https://api.linkedin.com/v2/me?projection=(id,localizedFirstName,localizedLastName,profilePicture(displayImage~:playableStreams))', {
             headers: { Authorization: 'Bearer ' + access_token }
@@ -2542,14 +2615,6 @@ app.get('/login/linkedin/callback', async (req, res) => {
               document.getElementById('auto-close').style.display = 'none';
               document.getElementById('manual-close').style.display = 'block';
             }
-
-            window.addEventListener('beforeunload', function() {
-              if (window.opener && !window.opener.closed) {
-                window.opener.postMessage({
-                  source: source, loginToken: token, status: 'success'
-                }, targetOrigin);
-              }
-            });
           })();
         </script>
         <style>
@@ -2608,7 +2673,6 @@ app.get('/login/tokeninfo/linkedin', (req, res) => {
     res.status(401).json({ failed: true, error: 'Invalid or expired token' });
   }
 });
-
 
 ///////////////////////////////////////////////////
 /////////    GOOGLE DRIVE PICKER    ///////////////
