@@ -1815,7 +1815,10 @@ async function getGoogleLoginCredentials(memberUniqueId) {
   try {
     const response = await fetch("https://upward.page/api/1.1/wf/get_google_login_credentials", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { 
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
+      },
       body: JSON.stringify({ member: memberUniqueId })
     });
 
