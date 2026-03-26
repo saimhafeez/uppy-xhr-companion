@@ -2072,33 +2072,96 @@ app.get('/login/tokeninfo/google', (req, res) => {
 ///////////////////////////////////////////////////
 
 const CONFIG_FACEBOOK_LOGIN = {
-  APP_ID: process.env.FACEBOOK_APP_ID,
-  APP_SECRET: process.env.FACEBOOK_APP_SECRET,
+  DEFAULT_APP_ID: process.env.FACEBOOK_APP_ID,
+  DEFAULT_APP_SECRET: process.env.FACEBOOK_APP_SECRET,
+  DEFAULT_DOMAIN: process.env.COMPANION_DOMAIN,
   JWT_SECRET: process.env.COMPANION_SECRET,
   TOKEN_EXPIRY: '2m',
-  COOKIE_NAME: 'facebook_login_state',
-  COMPANION_DOMAIN: `https://${process.env.COMPANION_DOMAIN}`
+  COOKIE_NAME: 'facebook_login_state'
 };
 
+// Helper: Get Dynamic Facebook Login Credentials & Domain
+async function getFacebookLoginCredentials(memberUniqueId) {
+  let credentials = {
+    appId: CONFIG_FACEBOOK_LOGIN.DEFAULT_APP_ID,
+    appSecret: CONFIG_FACEBOOK_LOGIN.DEFAULT_APP_SECRET,
+    // Default redirect URI
+    redirectUri: `https://${CONFIG_FACEBOOK_LOGIN.DEFAULT_DOMAIN}/login/facebook/oauth/callback`
+  };
+
+  if (!memberUniqueId) return credentials;
+
+  try {
+    const response = await fetch("https://upward.page/api/1.1/wf/get_facebook_login_credentials", {
+      method: "POST",
+      headers: { 
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
+      },
+      body: JSON.stringify({ member: memberUniqueId })
+    });
+
+    if (response.ok) {
+      const json = await response.json();
+      const data = json.response || json;
+
+      const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
+
+      if (isPrivateLabelled) {
+        if (data.app_id && data.app_secret) {
+          credentials.appId = data.app_id;
+          credentials.appSecret = data.app_secret;
+        }
+
+        if (data.companion_domain) {
+           let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+           credentials.redirectUri = `https://${cleanDomain}/login/facebook/oauth/callback`;
+        }
+      }
+    }
+  } catch (error) {
+    console.error(`[Facebook Login Auth] API check failed for ${memberUniqueId}:`, error.message);
+  }
+
+  return credentials;
+}
+
 // ==== State Token utils ====
-function generateFbLoginStateToken(origin) {
-  return jwt.sign({ origin }, CONFIG_FACEBOOK_LOGIN.JWT_SECRET, { expiresIn: CONFIG_FACEBOOK_LOGIN.TOKEN_EXPIRY });
+function generateFbLoginStateToken(origin, memberUniqueId) {
+  return jwt.sign({ origin, memberUniqueId }, CONFIG_FACEBOOK_LOGIN.JWT_SECRET, { expiresIn: CONFIG_FACEBOOK_LOGIN.TOKEN_EXPIRY });
 }
 function verifyFbLoginStateToken(token) {
   try {
-    const decoded = jwt.verify(token, CONFIG_FACEBOOK_LOGIN.JWT_SECRET);
-    return decoded.origin;
+    return jwt.verify(token, CONFIG_FACEBOOK_LOGIN.JWT_SECRET);
   } catch {
     return null;
   }
 }
 
 // ==== FACEBOOK LOGIN START ====
-app.get('/login/facebook/oauth', (req, res) => {
-  const { origin } = req.query;
+app.get('/login/facebook/oauth', async (req, res) => {
+  const { origin, member_unique_id } = req.query;
   if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
 
-  const stateToken = generateFbLoginStateToken(origin);
+  // 1. Fetch Config
+  const creds = await getFacebookLoginCredentials(member_unique_id);
+
+  // 2. CHECK DOMAIN MATCH (Pre-flight Redirect)
+  try {
+    const targetUrlObj = new URL(creds.redirectUri);
+    const targetHost = targetUrlObj.host; 
+    const currentHost = req.get('host');  
+
+    if (targetHost && currentHost && targetHost !== currentHost) {
+      const newStartUrl = `https://${targetHost}/login/facebook/oauth?origin=${encodeURIComponent(origin)}&member_unique_id=${encodeURIComponent(member_unique_id)}`;
+      return res.redirect(newStartUrl);
+    }
+  } catch (e) {
+    console.error("Error checking domain match", e);
+  }
+
+  // 3. Generate State & Set Cookie
+  const stateToken = generateFbLoginStateToken(origin, member_unique_id);
   res.cookie(CONFIG_FACEBOOK_LOGIN.COOKIE_NAME, stateToken, {
     httpOnly: true,
     secure: true,
@@ -2106,9 +2169,8 @@ app.get('/login/facebook/oauth', (req, res) => {
     maxAge: 120000
   });
 
-  const redirectUri = `${CONFIG_FACEBOOK_LOGIN.COMPANION_DOMAIN}/login/facebook/oauth/callback`;
-  const authUrl = `https://www.facebook.com/v19.0/dialog/oauth?client_id=${encodeURIComponent(CONFIG_FACEBOOK_LOGIN.APP_ID)}`
-    + `&redirect_uri=${encodeURIComponent(redirectUri)}`
+  const authUrl = `https://www.facebook.com/v19.0/dialog/oauth?client_id=${encodeURIComponent(creds.appId)}`
+    + `&redirect_uri=${encodeURIComponent(creds.redirectUri)}`
     + `&scope=email,public_profile`
     + `&response_type=code`
     + `&state=facebook-login`;
@@ -2120,25 +2182,38 @@ app.get('/login/facebook/oauth', (req, res) => {
 app.get('/login/facebook/oauth/callback', async (req, res) => {
   const { code } = req.query;
   const stateToken = req.cookies[CONFIG_FACEBOOK_LOGIN.COOKIE_NAME];
-  if (!stateToken) return res.status(400).send('Missing state token');
-  const origin = verifyFbLoginStateToken(stateToken);
-  if (!origin) return res.status(400).send('Invalid state token');
+  
+  const decodedState = verifyFbLoginStateToken(stateToken);
   res.clearCookie(CONFIG_FACEBOOK_LOGIN.COOKIE_NAME);
 
+  if (!decodedState || !decodedState.origin) {
+    return res.status(400).send(`
+      <html><body>
+      <h3>Missing or invalid state token</h3>
+      <p>This usually happens if your browser blocks third-party cookies, or if the domain changed during login.</p>
+      </body></html>
+    `);
+  }
+
+  const origin = decodedState.origin;
+  const memberUniqueId = decodedState.memberUniqueId;
+
   try {
-    // 1. Exchange code for access_token:
-    const redirectUri = `${CONFIG_FACEBOOK_LOGIN.COMPANION_DOMAIN}/login/facebook/oauth/callback`;
+    // 1. Re-fetch Credentials (to get correct app_id/secret/redirect_uri)
+    const creds = await getFacebookLoginCredentials(memberUniqueId);
+
+    // 2. Exchange code for access_token:
     const accessResp = await axios.get('https://graph.facebook.com/v19.0/oauth/access_token', {
       params: {
-        client_id: CONFIG_FACEBOOK_LOGIN.APP_ID,
-        client_secret: CONFIG_FACEBOOK_LOGIN.APP_SECRET,
-        redirect_uri: redirectUri,
+        client_id: creds.appId,
+        client_secret: creds.appSecret,
+        redirect_uri: creds.redirectUri,
         code
       }
     });
     const access_token = accessResp.data.access_token;
 
-    // 2. Fetch user info
+    // 3. Fetch user info
     const userResp = await axios.get('https://graph.facebook.com/me', {
       params: {
         fields: 'id,first_name,last_name,email,picture.type(large)',
