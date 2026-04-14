@@ -3093,17 +3093,29 @@ app.get('/dns', async (req, res) => {
 ///////////////////////////////////////////////////
 
 app.all('/debug/headers', (req, res) => {
-  console.log('=== INCOMING REQUEST HEADERS ===');
+  // 1. Explicitly pull out all variables related to "where this came from"
+  const originInfo = {
+    exact_origin_header: req.headers.origin || "Not provided",
+    referer_header: req.headers.referer || req.headers.referrer || "Not provided",
+    host_header: req.headers.host || "Not provided",
+    express_ip: req.ip,
+    x_forwarded_for: req.headers['x-forwarded-for'] || "Not provided",
+    x_real_ip: req.headers['x-real-ip'] || "Not provided",
+    user_agent: req.headers['user-agent'] || "Not provided"
+  };
+
+  console.log('=== WHERE DID THIS COME FROM? ===');
+  console.log(JSON.stringify(originInfo, null, 2));
+  console.log('=== FULL INCOMING HEADERS ===');
   console.log(JSON.stringify(req.headers, null, 2));
   console.log('================================');
 
+  // 2. Send it back to the client
   res.status(200).json({
     ok: true,
-    message: 'Headers logged successfully',
-    method: req.method,
-    url: req.originalUrl,
-    ip: req.ip,
-    headers: req.headers
+    message: 'If origin/referer are "Not provided", the client simply did not send them.',
+    where_it_came_from: originInfo,
+    all_raw_headers: req.headers
   });
 });
 
