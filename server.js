@@ -3088,6 +3088,27 @@ app.get('/dns', async (req, res) => {
 
 
 
+///////////////////////////////////////////////////
+///////////      Request Headers  /////////////////
+///////////////////////////////////////////////////
+
+app.all('/debug/headers', (req, res) => {
+  console.log('=== INCOMING REQUEST HEADERS ===');
+  console.log(JSON.stringify(req.headers, null, 2));
+  console.log('================================');
+
+  res.status(200).json({
+    ok: true,
+    message: 'Headers logged successfully',
+    method: req.method,
+    url: req.originalUrl,
+    ip: req.ip,
+    headers: req.headers
+  });
+});
+
+
+
 
 ///////////////////////////////////////////////////
 ///////////         Server        /////////////////
