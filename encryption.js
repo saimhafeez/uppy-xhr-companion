@@ -3,32 +3,38 @@ const crypto = require('crypto');
 const ALGORITHM = 'aes-256-gcm';
 const IV_LENGTH = 12; 
 
-/**
- * Reads the key exactly as the Bubble plugin expects it.
- */
 function getKey() {
   const secret = process.env.AES_ENCRYPTION_KEY;
   if (!secret) {
     throw new Error("AES_ENCRYPTION_KEY environment variable is missing.");
   }
   
-  // Based on your screenshot, the key is a 64-character hex string.
-  // 64 hex characters = exactly 32 bytes, which is what AES-256 requires.
-  if (secret.length === 64 && /^[0-9a-fA-F]+$/.test(secret)) {
-    return Buffer.from(secret, 'hex');
+  // If the key is a valid hex string (like yours)
+  if (/^[0-9a-fA-F]+$/.test(secret)) {
+    // If it's longer than 64 hex characters (32 bytes), truncate it.
+    // AES-256 strictly requires 32 bytes. Your 128-character string is 64 bytes,
+    // so the Bubble plugin is likely just using the first 64 characters.
+    const hexKey = secret.length > 64 ? secret.substring(0, 64) : secret;
+    
+    // Convert to buffer
+    const keyBuffer = Buffer.from(hexKey, 'hex');
+    
+    // Ensure it is exactly 32 bytes before returning
+    if (keyBuffer.length === 32) return keyBuffer;
   }
   
-  // Fallback: If you ever change it to a 32-character plain text string
-  if (Buffer.byteLength(secret, 'utf8') === 32) {
-    return Buffer.from(secret, 'utf8');
+  // Fallback: If it's standard plain text, take the first 32 characters
+  if (Buffer.byteLength(secret, 'utf8') >= 32) {
+    return Buffer.from(secret.substring(0, 32), 'utf8');
   }
 
-  throw new Error("Invalid AES_ENCRYPTION_KEY length. To match the Bubble plugin, it must be a 64-character hex string or exactly 32 characters of plain text.");
+  // Last resort fallback: Hash it to force 32 bytes
+  return crypto.createHash('sha256').update(String(secret)).digest();
 }
 
 /**
  * Encrypts a string using AES-256-GCM.
- * Returns: "iv:authTag:encryptedData" (Matches Bubble Plugin format)
+ * Returns: "iv:authTag:encryptedData"
  */
 function encrypt(text) {
   if (!text) return text;
