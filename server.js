@@ -17,6 +17,7 @@ const jwt = require('jsonwebtoken');
 const { createIPX, ipxFSStorage, ipxHttpStorage, createIPXNodeServer } = require('ipx');
 const axios = require('axios');
 const dns = require('dns').promises;
+const { encrypt } = require('./encryption');
 
 
 // AWS SDK v3
@@ -1147,7 +1148,9 @@ app.get('/login/zoom/callback', async (req, res) => {
       throw new Error(`Token error: ${tokenObj.error} - ${tokenObj.reason || ''}`);
     }
 
-    const refresh_token = tokenObj.refresh_token || null;
+    // Encrypt the refresh token before storing it in the JWT
+    const raw_refresh_token = tokenObj.refresh_token || null;
+    const refresh_token = raw_refresh_token ? encrypt(raw_refresh_token) : null;
     const refresh_token_expires_in = tokenObj.refresh_token_expires_in || null;
 
     // Fetch user info
@@ -1247,6 +1250,8 @@ app.get('/login/tokeninfo/zoom', (req, res) => {
     if (!decoded.refresh_token) {
       return res.status(401).json({ failed: true, error: 'No refresh_token present. Did user consent?' });
     }
+    
+    // The refresh_token returned here is the securely encrypted version
     res.json({
       refresh_token: decoded.refresh_token,
       refresh_token_expires_in: decoded.refresh_token_expires_in,
@@ -1260,6 +1265,7 @@ app.get('/login/tokeninfo/zoom', (req, res) => {
     res.status(401).json({ failed: true, error: 'Invalid or expired token' });
   }
 });
+
 
 
 /////////////////////////////////////////////////////
