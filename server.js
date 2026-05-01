@@ -161,7 +161,14 @@ async function uploadToMux({ filepath, mimetype, originalFilename, tokenId, toke
 
 const app = express();
 app.use(cors({ origin: '*', credentials: false }));
-app.use(bodyParser.json({ limit: '50mb' }));
+// Modified Body Parser to save the raw buffer for Facebook Webhook verification
+app.use(bodyParser.json({ 
+  limit: '50mb',
+  verify: (req, res, buf) => {
+    req.rawBody = buf;
+  }
+}));
+
 
 app.use(session({
   secret: process.env.COMPANION_SECRET,
@@ -3129,6 +3136,422 @@ app.all('/debug/headers', (req, res) => {
     all_raw_headers: req.headers
   });
 });
+
+///////////////////////////////////////////////////
+//////    FACEBOOK PAGE WEBHOOKS (LEADS)    ///////
+///////////////////////////////////////////////////
+
+const crypto = require('crypto');
+
+// You need to set this in your .env file. It can be any secure random string you choose.
+// You will type this exact same string into the Meta Developer Portal when setting up the webhook.
+const FACEBOOK_VERIFY_TOKEN = process.env.FACEBOOK_VERIFY_TOKEN || 'secure_upward_webhook_token_2026';
+
+// Bubble Backend Workflow URL where the leads will be sent
+// Replace with your actual Bubble endpoint
+const BUBBLE_WEBHOOK_RECEIVER = 'https://upward.page/api/1.1/wf/receive_facebook_lead';
+
+/**
+ * Endpoint 1: Webhook Verification (GET)
+ * Facebook hits this endpoint once when you configure the webhook in their developer portal
+ * to verify that you actually own this server.
+ */
+app.get('/webhooks/facebook', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+
+  if (mode && token) {
+    if (mode === 'subscribe' && token === FACEBOOK_VERIFY_TOKEN) {
+      console.log('✅ Facebook Webhook Verified');
+      return res.status(200).send(challenge);
+    } else {
+      console.error('❌ Facebook Webhook Verification Failed: Token Mismatch');
+      return res.sendStatus(403);
+    }
+  }
+  return res.sendStatus(400);
+});
+
+/**
+ * Endpoint 2: Webhook Event Receiver (POST)
+ * Facebook sends all likes, comments, and messages to this endpoint in real-time.
+ */
+app.post('/webhooks/facebook', async (req, res) => {
+  const signature = req.headers['x-hub-signature-256'];
+  const fbAppSecret = process.env.FACEBOOK_APP_SECRET; // Must be in your .env
+
+  // 1. Security Check: Verify the payload actually came from Facebook
+  if (!signature || !fbAppSecret) {
+    console.error('❌ Missing Facebook Signature or App Secret');
+    return res.sendStatus(401);
+  }
+
+  const expectedSignature = 'sha256=' + crypto
+    .createHmac('sha256', fbAppSecret)
+    .update(req.rawBody)
+    .digest('hex');
+
+  if (signature !== expectedSignature) {
+    console.error('❌ Facebook Signature Validation Failed');
+    return res.sendStatus(403);
+  }
+
+  // 2. Acknowledge Receipt
+  // Facebook requires a 200 OK within 20 seconds, or it will disable your webhook.
+  // We send the response immediately before processing the data.
+  res.status(200).send('EVENT_RECEIVED');
+
+  const body = req.body;
+
+  // 3. Ensure this is a Page event (not a user profile or permissions event)
+  if (body.object === 'page') {
+    
+    // Facebook batches events. There could be multiple entries in one request.
+    for (const entry of body.entry) {
+      // The ID of the specific Facebook Business Page where the interaction happened
+      const pageId = entry.id; 
+
+      // Loop through the specific changes/events that occurred on this page
+      for (const change of entry.changes) {
+        
+        // We only want to process feed interactions (comments, posts, likes)
+        if (change.field === 'feed') {
+          const eventData = change.value;
+          
+          // Example: Only process Comments
+          if (eventData.item === 'comment' && eventData.verb === 'add') {
+            
+            const leadData = {
+              page_id: pageId,
+              lead_name: eventData.from.name,
+              lead_facebook_id: eventData.from.id,
+              message: eventData.message,
+              post_id: eventData.post_id,
+              interaction_type: 'comment',
+              timestamp: eventData.created_time
+            };
+
+            // 4. Route the data to your Bubble.io Application
+            try {
+              const bubbleResponse = await fetch(BUBBLE_WEBHOOK_RECEIVER, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  // Use your Bubble API token if the endpoint is not public
+                  'Authorization': `Bearer ${process.env.BUBBLE_AUTH_SECRET}` 
+                },
+                body: JSON.stringify(leadData)
+              });
+
+              if (!bubbleResponse.ok) {
+                console.error('❌ Failed to route lead to Bubble:', await bubbleResponse.text());
+              } else {
+                console.log(`✅ Successfully routed lead ${leadData.lead_name} to Bubble for Page ${pageId}`);
+              }
+            } catch (error) {
+              console.error('❌ Error communicating with Bubble:', error);
+            }
+          }
+          
+          // You can add additional 'else if' statements here to handle likes, shares, or direct messages.
+        }
+      }
+    }
+  }
+});
+
+
+///////////////////////////////////////////////////
+//   Facebook Business Pages OAuth (CRM Setup)   //
+///////////////////////////////////////////////////
+
+const CONFIG_FACEBOOK_PAGES = {
+  DEFAULT_APP_ID: process.env.FACEBOOK_APP_ID,
+  DEFAULT_APP_SECRET: process.env.FACEBOOK_APP_SECRET,
+  DEFAULT_DOMAIN: process.env.COMPANION_DOMAIN,
+  JWT_SECRET: process.env.COMPANION_SECRET,
+  TOKEN_EXPIRY: '10m', // Slightly longer to allow Bubble time to process multiple pages
+  COOKIE_NAME: 'facebook_pages_state'
+};
+
+// Helper: Get Dynamic Credentials & Domain specifically for the Pages route
+async function getFacebookPagesCredentials(memberUniqueId) {
+  let credentials = {
+    appId: CONFIG_FACEBOOK_PAGES.DEFAULT_APP_ID,
+    appSecret: CONFIG_FACEBOOK_PAGES.DEFAULT_APP_SECRET,
+    redirectUri: `https://${CONFIG_FACEBOOK_PAGES.DEFAULT_DOMAIN}/login/facebook-pages/oauth/callback`
+  };
+
+  if (!memberUniqueId) return credentials;
+
+  try {
+    // Reusing your existing API endpoint since the App ID/Secret are the same, 
+    // we just need to construct a different redirect URI.
+    const response = await fetch("https://upward.page/api/1.1/wf/get_facebook_login_credentials", {
+      method: "POST",
+      headers: { 
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
+      },
+      body: JSON.stringify({ member: memberUniqueId })
+    });
+
+    if (response.ok) {
+      const json = await response.json();
+      const data = json.response || json;
+
+      const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
+
+      if (isPrivateLabelled) {
+        if (data.app_id && data.app_secret) {
+          credentials.appId = data.app_id;
+          credentials.appSecret = data.app_secret;
+        }
+        if (data.companion_domain) {
+           let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+           credentials.redirectUri = `https://${cleanDomain}/login/facebook-pages/oauth/callback`;
+        }
+      }
+    }
+  } catch (error) {
+    console.error(`[Facebook Pages Auth] API check failed for ${memberUniqueId}:`, error.message);
+  }
+
+  return credentials;
+}
+
+// ==== State Token utils ====
+function generateFbPagesStateToken(origin, memberUniqueId) {
+  return jwt.sign({ origin, memberUniqueId }, CONFIG_FACEBOOK_PAGES.JWT_SECRET, { expiresIn: CONFIG_FACEBOOK_PAGES.TOKEN_EXPIRY });
+}
+function verifyFbPagesStateToken(token) {
+  try {
+    return jwt.verify(token, CONFIG_FACEBOOK_PAGES.JWT_SECRET);
+  } catch {
+    return null;
+  }
+}
+
+// ==== 1. FACEBOOK PAGES LOGIN START ====
+app.get('/login/facebook-pages/oauth', async (req, res) => {
+  const { origin, member_unique_id } = req.query;
+  if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
+
+  // 1. Fetch Config
+  const creds = await getFacebookPagesCredentials(member_unique_id);
+
+  // 2. CHECK DOMAIN MATCH (Pre-flight Redirect)
+  try {
+    const targetUrlObj = new URL(creds.redirectUri);
+    const targetHost = targetUrlObj.host; 
+    const currentHost = req.get('host');  
+
+    if (targetHost && currentHost && targetHost !== currentHost) {
+      const newStartUrl = `https://${targetHost}/login/facebook-pages/oauth?origin=${encodeURIComponent(origin)}&member_unique_id=${encodeURIComponent(member_unique_id)}`;
+      return res.redirect(newStartUrl);
+    }
+  } catch (e) {
+    console.error("Error checking domain match", e);
+  }
+
+  // 3. Generate State & Set Cookie
+  const stateToken = generateFbPagesStateToken(origin, member_unique_id);
+  res.cookie(CONFIG_FACEBOOK_PAGES.COOKIE_NAME, stateToken, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'none',
+    maxAge: 120000
+  });
+
+  // CRITICAL: We are requesting Business Page management scopes here
+  const scopes = 'email,public_profile,pages_show_list,pages_read_engagement,pages_manage_metadata';
+
+  const authUrl = `https://www.facebook.com/v19.0/dialog/oauth?client_id=${encodeURIComponent(creds.appId)}`
+    + `&redirect_uri=${encodeURIComponent(creds.redirectUri)}`
+    + `&scope=${scopes}`
+    + `&response_type=code`
+    + `&state=facebook-pages-login`;
+
+  res.redirect(authUrl);
+});
+
+// ==== 2. FACEBOOK PAGES OAUTH CALLBACK ====
+app.get('/login/facebook-pages/oauth/callback', async (req, res) => {
+  const { code } = req.query;
+  const stateToken = req.cookies[CONFIG_FACEBOOK_PAGES.COOKIE_NAME];
+  
+  const decodedState = verifyFbPagesStateToken(stateToken);
+  res.clearCookie(CONFIG_FACEBOOK_PAGES.COOKIE_NAME);
+
+  if (!decodedState || !decodedState.origin) {
+    return res.status(400).send(`
+      <html><body>
+      <h3>Missing or invalid state token</h3>
+      <p>This usually happens if your browser blocks third-party cookies, or if the domain changed during login.</p>
+      </body></html>
+    `);
+  }
+
+  const origin = decodedState.origin;
+  const memberUniqueId = decodedState.memberUniqueId;
+
+  try {
+    // 1. Re-fetch Credentials
+    const creds = await getFacebookPagesCredentials(memberUniqueId);
+
+    // 2. Exchange code for short-lived access_token
+    const accessResp = await axios.get('https://graph.facebook.com/v19.0/oauth/access_token', {
+      params: {
+        client_id: creds.appId,
+        client_secret: creds.appSecret,
+        redirect_uri: creds.redirectUri,
+        code
+      }
+    });
+    let access_token = accessResp.data.access_token;
+
+    // 3. Exchange short-lived token for LONG-LIVED token (Lasts 60 days)
+    // This step ensures the Page Tokens we generate next will never expire.
+    const longLivedResp = await axios.get('https://graph.facebook.com/v19.0/oauth/access_token', {
+      params: {
+        grant_type: 'fb_exchange_token',
+        client_id: creds.appId,
+        client_secret: creds.appSecret,
+        fb_exchange_token: access_token
+      }
+    });
+    access_token = longLivedResp.data.access_token;
+
+    // 4. Fetch the Business Pages the user manages
+    const pagesResp = await axios.get('https://graph.facebook.com/v19.0/me/accounts', {
+      params: { access_token }
+    });
+    
+    // Create a clean array of the user's pages
+    const userPages = pagesResp.data.data.map(page => ({
+      page_id: page.id,
+      page_name: page.name,
+      page_access_token: page.access_token // This is the token Bubble saves to do actions as the page
+    }));
+
+    // 5. Fetch basic user info just in case
+    const userResp = await axios.get('https://graph.facebook.com/me', {
+      params: { fields: 'id,first_name,last_name,email', access_token }
+    });
+    const user = userResp.data;
+
+    // 6. Pack it all into the JWT for Bubble
+    const infoForJwt = {
+      first_name: user.first_name || "",
+      last_name: user.last_name || "",
+      email: user.email || "",
+      facebook_user_id: user.id,
+      pages: userPages // Array of their business pages
+    };
+
+    const loginToken = jwt.sign(infoForJwt, CONFIG_FACEBOOK_PAGES.JWT_SECRET, { expiresIn: CONFIG_FACEBOOK_PAGES.TOKEN_EXPIRY });
+
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Facebook Pages Connection</title>
+        <script>
+          (function() {
+            const token = '${loginToken}';
+            const targetOrigin = '${origin}';
+            const source = 'companion-facebook-pages'; // Unique source identifier
+
+            if (window.opener && !window.opener.closed) {
+              window.opener.postMessage({
+                source: source,
+                loginToken: token,
+                status: 'success'
+              }, targetOrigin);
+
+              localStorage.setItem('facebookPagesToken', token);
+              localStorage.setItem('facebookPagesOrigin', targetOrigin);
+
+              setTimeout(() => window.close(), 100);
+            } else {
+              document.getElementById('auto-close').style.display = 'none';
+              document.getElementById('manual-close').style.display = 'block';
+            }
+
+            window.addEventListener('beforeunload', function() {
+              if (window.opener && !window.opener.closed) {
+                window.opener.postMessage({
+                  source: source,
+                  loginToken: token,
+                  status: 'success'
+                }, targetOrigin);
+              }
+            });
+          })();
+        </script>
+        <style>
+          body { font-family: Arial, sans-serif; text-align: center; padding: 40px; }
+          #manual-close { display: none; margin-top: 20px; }
+          button { padding: 10px 20px; background: #1877f3; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        </style>
+      </head>
+      <body>
+        <p id="auto-close">Connection complete. Closing window...</p>
+        <div id="manual-close">
+          <p>Connection complete. You may now close this window.</p>
+          <button onclick="window.close()">Close Window</button>
+        </div>
+      </body>
+      </html>
+    `);
+  } catch (error) {
+    // If user denies page access, Facebook throws an error here. We handle it cleanly.
+    const safeMsg = ('' + (error.response?.data?.error?.message || error.message)).replace(/'/g, "\\'");
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Connection Error</title>
+        <script>
+          window.opener && window.opener.postMessage({
+            source: 'companion-facebook-pages',
+            status: 'error',
+            error: '${safeMsg}'
+          }, '${origin}');
+          window.close();
+        </script>
+      </head>
+      <body>
+        <p>Authentication failed. Closing window...</p>
+      </body>
+      </html>
+    `);
+  }
+});
+
+// ==== 3. TOKEN INFO ENDPOINT (For Bubble Plugin to Decode) ====
+app.get('/login/tokeninfo/facebook-pages', (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ failed: true, error: 'Token is required' });
+
+  try {
+    const decoded = jwt.verify(token, CONFIG_FACEBOOK_PAGES.JWT_SECRET);
+
+    // This returns the full array of pages back to Bubble
+    res.json({
+      first_name: decoded.first_name,
+      last_name: decoded.last_name,
+      email: decoded.email,
+      facebook_user_id: decoded.facebook_user_id,
+      pages: decoded.pages,
+      failed: false
+    });
+  } catch (err) {
+    res.status(401).json({ failed: true, error: 'Invalid or expired token' });
+  }
+});
+
 
 
 
