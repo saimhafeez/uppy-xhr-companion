@@ -3516,28 +3516,38 @@ app.post('/webhooks/facebook', async (req, res) => {
                  continue;
               }
 
+              // Update: Meta v25 uses 'reaction' instead of 'like'
               if (
                 (eventData.item === 'comment' && eventData.verb === 'add') ||
-                (eventData.item === 'like' && eventData.verb === 'add') ||
+                (eventData.item === 'reaction' && eventData.verb === 'add') ||
                 (eventData.item === 'share' && eventData.verb === 'add')
               ) {
-                console.log(`   🎯 VALID LEAD TRIGGER: ${eventData.from.name} performed a ${eventData.item}`);
+                
+                const interactionString = eventData.item === 'reaction' ? eventData.reaction_type : eventData.item;
+                console.log(`   🎯 VALID LEAD TRIGGER: ${eventData.from.name} performed a ${interactionString}`);
 
                 // Dynamically build the direct Facebook link
-                // If it's a comment or a like on a post, we link directly to the post.
-                // Otherwise, we fallback to linking to the Business Page itself.
-                const directUrl = eventData.post_id 
-                  ? `https://www.facebook.com/${eventData.post_id}` 
-                  : `https://www.facebook.com/${pageId}`;
+                let directUrl = `https://www.facebook.com/${pageId}`;
+                if (eventData.comment_id) {
+                    directUrl = `https://www.facebook.com/${eventData.comment_id}`;
+                } else if (eventData.post_id) {
+                    directUrl = `https://www.facebook.com/${eventData.post_id}`;
+                }
+
+                // If message is missing, provide a descriptive fallback
+                let defaultMessage = `User left a comment.`;
+                if (eventData.item === 'reaction') defaultMessage = `User reacted with a ${eventData.reaction_type}.`;
+                if (eventData.item === 'share') defaultMessage = `User shared a post.`;
 
                 const leadData = {
                   page_id: pageId,
                   lead_name: eventData.from.name,
                   lead_facebook_id: eventData.from.id,
-                  message: eventData.message || `User performed a ${eventData.item}`, 
-                  post_id: eventData.post_id,
-                  facebook_url: directUrl, // <--- New URL field sent to Bubble
-                  interaction_type: eventData.item, 
+                  message: eventData.message || defaultMessage, 
+                  post_id: eventData.post_id || null,
+                  comment_id: eventData.comment_id || null,
+                  facebook_url: directUrl, 
+                  interaction_type: interactionString, 
                   timestamp: eventData.created_time
                 };
 
