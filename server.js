@@ -3156,19 +3156,24 @@ const BUBBLE_WEBHOOK_RECEIVER = 'https://upward.page/api/1.1/wf/receive_facebook
  * Meta hits this endpoint once when you subscribe to the webhook in the App Dashboard.
  */
 app.get('/webhooks/facebook', (req, res) => {
+  console.log('\n=== 🔵 INCOMING WEBHOOK VERIFICATION (GET) ===');
+  
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
+
+  console.log(`Mode: ${mode}, Token: ${token}, Challenge: ${challenge}`);
 
   if (mode && token) {
     if (mode === 'subscribe' && token === FACEBOOK_VERIFY_TOKEN) {
       console.log('✅ Facebook Webhook Verified Successfully');
       return res.status(200).send(challenge);
     } else {
-      console.error('❌ Facebook Webhook Verification Failed: Token Mismatch');
+      console.error(`❌ Verification Failed. Expected Token: ${FACEBOOK_VERIFY_TOKEN}, Received: ${token}`);
       return res.sendStatus(403);
     }
   }
+  console.error('❌ Missing mode or token in request');
   return res.sendStatus(400);
 });
 
@@ -3177,9 +3182,13 @@ app.get('/webhooks/facebook', (req, res) => {
  * Meta sends all real-time likes, comments, and shares to this endpoint.
  */
 app.post('/webhooks/facebook', async (req, res) => {
+  console.log('\n===================================================');
+  console.log('📬 NEW FACEBOOK WEBHOOK EVENT RECEIVED (POST)');
+  
   const signature = req.headers['x-hub-signature-256'];
-  // Use the Business App Secret to decode the signature
   const fbAppSecret = process.env.FACEBOOK_BUSINESS_APP_SECRET; 
+
+  console.log('➡️ X-Hub-Signature-256:', signature || 'MISSING');
 
   // 1. Security Check: Verify the payload actually came from Meta
   if (!signature || !fbAppSecret) {
@@ -3187,59 +3196,75 @@ app.post('/webhooks/facebook', async (req, res) => {
     return res.sendStatus(401);
   }
 
-  // Create a hash using the raw body buffer saved by our body-parser middleware
   const expectedSignature = 'sha256=' + crypto
     .createHmac('sha256', fbAppSecret)
     .update(req.rawBody)
     .digest('hex');
 
   if (signature !== expectedSignature) {
-    console.error('❌ Facebook Signature Validation Failed (Possible spoofing attempt)');
+    console.error('❌ Signature Validation Failed!');
+    console.error(`Expected: ${expectedSignature}`);
+    console.error(`Received: ${signature}`);
     return res.sendStatus(403);
   }
 
+  console.log('🔐 Signature validation successful!');
+
   // 2. Acknowledge Receipt IMMEDIATELY
-  // Meta requires a 200 OK response within 20 seconds, otherwise it assumes 
-  // your server is down and will eventually disable your webhook.
   res.status(200).send('EVENT_RECEIVED');
+  console.log('✅ 200 OK EVENT_RECEIVED sent back to Meta');
 
   const body = req.body;
+  
+  // Log the entire raw payload from Facebook so you can inspect its structure
+  console.log('\n📦 FULL WEBHOOK PAYLOAD FROM META:');
+  console.log(JSON.stringify(body, null, 2));
+  console.log('---------------------------------------------------');
 
   // 3. Process the Data (Ensure it's a Page event)
   if (body.object === 'page') {
     
-    // Meta sometimes batches multiple events into a single request
     for (const entry of body.entry) {
-      const pageId = entry.id; // The ID of the Business Page that received the engagement
+      const pageId = entry.id; 
+      console.log(`\n📄 Processing events for Page ID: ${pageId}`);
 
-      // Iterate through the specific changes/events
       if (entry.changes) {
         for (const change of entry.changes) {
+          console.log(`➡️ Found change on field: [${change.field}]`);
           
-          // We only care about the 'feed' which contains comments, likes, and shares
           if (change.field === 'feed') {
             const eventData = change.value;
             
-            // Only process if the event was triggered by someone else (not the page itself)
-            // and ensure we have sender data
-            if (eventData.from && eventData.from.id !== pageId) {
-              
-              // Filter for Comments, Likes, and Shares (add verbs)
+            console.log(`   Item: ${eventData.item}, Verb: ${eventData.verb}`);
+
+            // Ensure we have sender data and the sender is NOT the page itself
+            if (eventData.from) {
+              if (eventData.from.id === pageId) {
+                 console.log(`   ⏭️ Ignoring event: Action was performed by the Page itself.`);
+                 continue;
+              }
+
+              // Filter for Comments, Likes, and Shares
               if (
                 (eventData.item === 'comment' && eventData.verb === 'add') ||
                 (eventData.item === 'like' && eventData.verb === 'add') ||
                 (eventData.item === 'share' && eventData.verb === 'add')
               ) {
                 
+                console.log(`   🎯 VALID LEAD TRIGGER: ${eventData.from.name} performed a ${eventData.item}`);
+
                 const leadData = {
                   page_id: pageId,
                   lead_name: eventData.from.name,
                   lead_facebook_id: eventData.from.id,
-                  message: eventData.message || `User performed a ${eventData.item}`, // Likes/shares don't always have a message
+                  message: eventData.message || `User performed a ${eventData.item}`, 
                   post_id: eventData.post_id,
-                  interaction_type: eventData.item, // 'comment', 'like', or 'share'
+                  interaction_type: eventData.item, 
                   timestamp: eventData.created_time
                 };
+
+                console.log('\n📤 PREPARING TO SEND TO BUBBLE:');
+                console.log(JSON.stringify(leadData, null, 2));
 
                 // 4. Send the Lead to Bubble
                 try {
@@ -3247,7 +3272,6 @@ app.post('/webhooks/facebook', async (req, res) => {
                     method: 'POST',
                     headers: {
                       'Content-Type': 'application/json',
-                      // Pass your Bubble Auth Secret so the endpoint can be secure
                       'Authorization': `Bearer ${process.env.BUBBLE_AUTH_SECRET}` 
                     },
                     body: JSON.stringify(leadData)
@@ -3255,21 +3279,31 @@ app.post('/webhooks/facebook', async (req, res) => {
 
                   if (!bubbleResponse.ok) {
                     const errorText = await bubbleResponse.text();
-                    console.error(`❌ Failed to route lead to Bubble: ${bubbleResponse.status}`, errorText);
+                    console.error(`\n❌ HTTP ERROR: Bubble rejected the request. Status: ${bubbleResponse.status}`);
+                    console.error(`Bubble Error Details: ${errorText}`);
                   } else {
-                    console.log(`✅ Successfully routed ${eventData.item} from ${leadData.lead_name} to Bubble CRM (Page ID: ${pageId})`);
+                    const successData = await bubbleResponse.json();
+                    console.log(`\n🚀 SUCCESS! Bubble successfully received the lead.`);
+                    console.log(`Bubble Response:`, successData);
                   }
                 } catch (error) {
-                  console.error('❌ Error communicating with Bubble API:', error.message);
+                  console.error('\n❌ NETWORK ERROR: Failed to communicate with Bubble API:', error.message);
                 }
+              } else {
+                console.log(`   ⏭️ Ignoring event: ${eventData.item}/${eventData.verb} does not match target triggers.`);
               }
+            } else {
+               console.log(`   ⏭️ Ignoring event: No 'from' object found (Anonymous action).`);
             }
           }
         }
       }
     }
+  } else {
+    console.log(`⏭️ Ignoring webhook: Object type is '${body.object}', not 'page'.`);
   }
 });
+
 
 
 
