@@ -3137,24 +3137,23 @@ app.all('/debug/headers', (req, res) => {
   });
 });
 
+
+
 ///////////////////////////////////////////////////
 //////    FACEBOOK PAGE WEBHOOKS (LEADS)    ///////
 ///////////////////////////////////////////////////
 
 const crypto = require('crypto');
 
-// You need to set this in your .env file. It can be any secure random string you choose.
-// You will type this exact same string into the Meta Developer Portal when setting up the webhook.
+// The secret token you create to verify Facebook's initial connection
 const FACEBOOK_VERIFY_TOKEN = process.env.FACEBOOK_VERIFY_TOKEN || 'secure_upward_webhook_token_2026';
 
-// Bubble Backend Workflow URL where the leads will be sent
-// Replace with your actual Bubble endpoint
+// Your Bubble backend endpoint
 const BUBBLE_WEBHOOK_RECEIVER = 'https://upward.page/api/1.1/wf/receive_facebook_lead';
 
 /**
  * Endpoint 1: Webhook Verification (GET)
- * Facebook hits this endpoint once when you configure the webhook in their developer portal
- * to verify that you actually own this server.
+ * Meta hits this endpoint once when you subscribe to the webhook in the App Dashboard.
  */
 app.get('/webhooks/facebook', (req, res) => {
   const mode = req.query['hub.mode'];
@@ -3163,7 +3162,7 @@ app.get('/webhooks/facebook', (req, res) => {
 
   if (mode && token) {
     if (mode === 'subscribe' && token === FACEBOOK_VERIFY_TOKEN) {
-      console.log('✅ Facebook Webhook Verified');
+      console.log('✅ Facebook Webhook Verified Successfully');
       return res.status(200).send(challenge);
     } else {
       console.error('❌ Facebook Webhook Verification Failed: Token Mismatch');
@@ -3175,91 +3174,103 @@ app.get('/webhooks/facebook', (req, res) => {
 
 /**
  * Endpoint 2: Webhook Event Receiver (POST)
- * Facebook sends all likes, comments, and messages to this endpoint in real-time.
+ * Meta sends all real-time likes, comments, and shares to this endpoint.
  */
 app.post('/webhooks/facebook', async (req, res) => {
   const signature = req.headers['x-hub-signature-256'];
-  const fbAppSecret = process.env.FACEBOOK_APP_SECRET; // Must be in your .env
+  // Use the Business App Secret to decode the signature
+  const fbAppSecret = process.env.FACEBOOK_BUSINESS_APP_SECRET; 
 
-  // 1. Security Check: Verify the payload actually came from Facebook
+  // 1. Security Check: Verify the payload actually came from Meta
   if (!signature || !fbAppSecret) {
     console.error('❌ Missing Facebook Signature or App Secret');
     return res.sendStatus(401);
   }
 
+  // Create a hash using the raw body buffer saved by our body-parser middleware
   const expectedSignature = 'sha256=' + crypto
     .createHmac('sha256', fbAppSecret)
     .update(req.rawBody)
     .digest('hex');
 
   if (signature !== expectedSignature) {
-    console.error('❌ Facebook Signature Validation Failed');
+    console.error('❌ Facebook Signature Validation Failed (Possible spoofing attempt)');
     return res.sendStatus(403);
   }
 
-  // 2. Acknowledge Receipt
-  // Facebook requires a 200 OK within 20 seconds, or it will disable your webhook.
-  // We send the response immediately before processing the data.
+  // 2. Acknowledge Receipt IMMEDIATELY
+  // Meta requires a 200 OK response within 20 seconds, otherwise it assumes 
+  // your server is down and will eventually disable your webhook.
   res.status(200).send('EVENT_RECEIVED');
 
   const body = req.body;
 
-  // 3. Ensure this is a Page event (not a user profile or permissions event)
+  // 3. Process the Data (Ensure it's a Page event)
   if (body.object === 'page') {
     
-    // Facebook batches events. There could be multiple entries in one request.
+    // Meta sometimes batches multiple events into a single request
     for (const entry of body.entry) {
-      // The ID of the specific Facebook Business Page where the interaction happened
-      const pageId = entry.id; 
+      const pageId = entry.id; // The ID of the Business Page that received the engagement
 
-      // Loop through the specific changes/events that occurred on this page
-      for (const change of entry.changes) {
-        
-        // We only want to process feed interactions (comments, posts, likes)
-        if (change.field === 'feed') {
-          const eventData = change.value;
+      // Iterate through the specific changes/events
+      if (entry.changes) {
+        for (const change of entry.changes) {
           
-          // Example: Only process Comments
-          if (eventData.item === 'comment' && eventData.verb === 'add') {
+          // We only care about the 'feed' which contains comments, likes, and shares
+          if (change.field === 'feed') {
+            const eventData = change.value;
             
-            const leadData = {
-              page_id: pageId,
-              lead_name: eventData.from.name,
-              lead_facebook_id: eventData.from.id,
-              message: eventData.message,
-              post_id: eventData.post_id,
-              interaction_type: 'comment',
-              timestamp: eventData.created_time
-            };
+            // Only process if the event was triggered by someone else (not the page itself)
+            // and ensure we have sender data
+            if (eventData.from && eventData.from.id !== pageId) {
+              
+              // Filter for Comments, Likes, and Shares (add verbs)
+              if (
+                (eventData.item === 'comment' && eventData.verb === 'add') ||
+                (eventData.item === 'like' && eventData.verb === 'add') ||
+                (eventData.item === 'share' && eventData.verb === 'add')
+              ) {
+                
+                const leadData = {
+                  page_id: pageId,
+                  lead_name: eventData.from.name,
+                  lead_facebook_id: eventData.from.id,
+                  message: eventData.message || `User performed a ${eventData.item}`, // Likes/shares don't always have a message
+                  post_id: eventData.post_id,
+                  interaction_type: eventData.item, // 'comment', 'like', or 'share'
+                  timestamp: eventData.created_time
+                };
 
-            // 4. Route the data to your Bubble.io Application
-            try {
-              const bubbleResponse = await fetch(BUBBLE_WEBHOOK_RECEIVER, {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  // Use your Bubble API token if the endpoint is not public
-                  'Authorization': `Bearer ${process.env.BUBBLE_AUTH_SECRET}` 
-                },
-                body: JSON.stringify(leadData)
-              });
+                // 4. Send the Lead to Bubble
+                try {
+                  const bubbleResponse = await fetch(BUBBLE_WEBHOOK_RECEIVER, {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/json',
+                      // Pass your Bubble Auth Secret so the endpoint can be secure
+                      'Authorization': `Bearer ${process.env.BUBBLE_AUTH_SECRET}` 
+                    },
+                    body: JSON.stringify(leadData)
+                  });
 
-              if (!bubbleResponse.ok) {
-                console.error('❌ Failed to route lead to Bubble:', await bubbleResponse.text());
-              } else {
-                console.log(`✅ Successfully routed lead ${leadData.lead_name} to Bubble for Page ${pageId}`);
+                  if (!bubbleResponse.ok) {
+                    const errorText = await bubbleResponse.text();
+                    console.error(`❌ Failed to route lead to Bubble: ${bubbleResponse.status}`, errorText);
+                  } else {
+                    console.log(`✅ Successfully routed ${eventData.item} from ${leadData.lead_name} to Bubble CRM (Page ID: ${pageId})`);
+                  }
+                } catch (error) {
+                  console.error('❌ Error communicating with Bubble API:', error.message);
+                }
               }
-            } catch (error) {
-              console.error('❌ Error communicating with Bubble:', error);
             }
           }
-          
-          // You can add additional 'else if' statements here to handle likes, shares, or direct messages.
         }
       }
     }
   }
 });
+
 
 
 ///////////////////////////////////////////////////
