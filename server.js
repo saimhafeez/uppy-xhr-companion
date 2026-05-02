@@ -3438,7 +3438,7 @@ app.get('/login/tokeninfo/facebook-pages', (req, res) => {
 const crypto = require('crypto');
 
 const FACEBOOK_VERIFY_TOKEN = process.env.FACEBOOK_VERIFY_TOKEN || 'secure_upward_webhook_token_2026';
-const BUBBLE_WEBHOOK_RECEIVER = 'https://upward.page/version-test/api/1.1/wf/receive_facebook_lead';
+const BUBBLE_WEBHOOK_RECEIVER = 'https://upward.page/api/1.1/wf/receive_facebook_lead';
 
 app.get('/webhooks/facebook', (req, res) => {
   console.log('\n=== 🔵 INCOMING WEBHOOK VERIFICATION (GET) ===');
