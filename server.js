@@ -3523,12 +3523,20 @@ app.post('/webhooks/facebook', async (req, res) => {
               ) {
                 console.log(`   🎯 VALID LEAD TRIGGER: ${eventData.from.name} performed a ${eventData.item}`);
 
+                // Dynamically build the direct Facebook link
+                // If it's a comment or a like on a post, we link directly to the post.
+                // Otherwise, we fallback to linking to the Business Page itself.
+                const directUrl = eventData.post_id 
+                  ? `https://www.facebook.com/${eventData.post_id}` 
+                  : `https://www.facebook.com/${pageId}`;
+
                 const leadData = {
                   page_id: pageId,
                   lead_name: eventData.from.name,
                   lead_facebook_id: eventData.from.id,
                   message: eventData.message || `User performed a ${eventData.item}`, 
                   post_id: eventData.post_id,
+                  facebook_url: directUrl, // <--- New URL field sent to Bubble
                   interaction_type: eventData.item, 
                   timestamp: eventData.created_time
                 };
