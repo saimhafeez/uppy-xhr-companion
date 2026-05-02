@@ -3267,11 +3267,12 @@ app.post('/webhooks/facebook', async (req, res) => {
 ///////////////////////////////////////////////////
 
 const CONFIG_FACEBOOK_PAGES = {
-  DEFAULT_APP_ID: process.env.FACEBOOK_APP_ID,
-  DEFAULT_APP_SECRET: process.env.FACEBOOK_APP_SECRET,
+  DEFAULT_APP_ID: process.env.FACEBOOK_BUSINESS_APP_ID,
+  DEFAULT_APP_SECRET: process.env.FACEBOOK_BUSINESS_APP_SECRET,
+  DEFAULT_CONFIG_ID: process.env.FACEBOOK_BUSINESS_LOGIN_CONFIG_ID,
   DEFAULT_DOMAIN: process.env.COMPANION_DOMAIN,
   JWT_SECRET: process.env.COMPANION_SECRET,
-  TOKEN_EXPIRY: '10m', // Slightly longer to allow Bubble time to process multiple pages
+  TOKEN_EXPIRY: '10m', 
   COOKIE_NAME: 'facebook_pages_state'
 };
 
@@ -3280,15 +3281,15 @@ async function getFacebookPagesCredentials(memberUniqueId) {
   let credentials = {
     appId: CONFIG_FACEBOOK_PAGES.DEFAULT_APP_ID,
     appSecret: CONFIG_FACEBOOK_PAGES.DEFAULT_APP_SECRET,
+    configId: CONFIG_FACEBOOK_PAGES.DEFAULT_CONFIG_ID,
     redirectUri: `https://${CONFIG_FACEBOOK_PAGES.DEFAULT_DOMAIN}/login/facebook-pages/oauth/callback`
   };
 
   if (!memberUniqueId) return credentials;
 
   try {
-    // Reusing your existing API endpoint since the App ID/Secret are the same, 
-    // we just need to construct a different redirect URI.
-    const response = await fetch("https://upward.page/api/1.1/wf/get_facebook_login_credentials", {
+    // Calling the new specific endpoint for Business Login
+    const response = await fetch("https://upward.page/api/1.1/wf/get_facebook_business_login_credentials", {
       method: "POST",
       headers: { 
         "Content-Type": "application/json",
@@ -3308,6 +3309,12 @@ async function getFacebookPagesCredentials(memberUniqueId) {
           credentials.appId = data.app_id;
           credentials.appSecret = data.app_secret;
         }
+        
+        // Extracting the new configuration_id returned from Bubble
+        if (data.configuration_id) {
+          credentials.configId = data.configuration_id;
+        }
+
         if (data.companion_domain) {
            let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
            credentials.redirectUri = `https://${cleanDomain}/login/facebook-pages/oauth/callback`;
@@ -3341,6 +3348,10 @@ app.get('/login/facebook-pages/oauth', async (req, res) => {
   // 1. Fetch Config
   const creds = await getFacebookPagesCredentials(member_unique_id);
 
+  if (!creds.configId) {
+      return res.status(500).json({ error: 'Missing configuration_id. Please ensure it is set in your environment variables or returned by the Bubble API.' });
+  }
+
   // 2. CHECK DOMAIN MATCH (Pre-flight Redirect)
   try {
     const targetUrlObj = new URL(creds.redirectUri);
@@ -3364,12 +3375,10 @@ app.get('/login/facebook-pages/oauth', async (req, res) => {
     maxAge: 120000
   });
 
-  // CRITICAL: We are requesting Business Page management scopes here
-  const scopes = 'email,public_profile,pages_show_list,pages_read_engagement,pages_manage_metadata';
-
+  // Launching Facebook Login for Business using the dynamically retrieved configId
   const authUrl = `https://www.facebook.com/v19.0/dialog/oauth?client_id=${encodeURIComponent(creds.appId)}`
     + `&redirect_uri=${encodeURIComponent(creds.redirectUri)}`
-    + `&scope=${scopes}`
+    + `&config_id=${encodeURIComponent(creds.configId)}`
     + `&response_type=code`
     + `&state=facebook-pages-login`;
 
@@ -3412,7 +3421,6 @@ app.get('/login/facebook-pages/oauth/callback', async (req, res) => {
     let access_token = accessResp.data.access_token;
 
     // 3. Exchange short-lived token for LONG-LIVED token (Lasts 60 days)
-    // This step ensures the Page Tokens we generate next will never expire.
     const longLivedResp = await axios.get('https://graph.facebook.com/v19.0/oauth/access_token', {
       params: {
         grant_type: 'fb_exchange_token',
@@ -3506,7 +3514,7 @@ app.get('/login/facebook-pages/oauth/callback', async (req, res) => {
       </html>
     `);
   } catch (error) {
-    // If user denies page access, Facebook throws an error here. We handle it cleanly.
+    // Cleanly handle API/Access denied errors
     const safeMsg = ('' + (error.response?.data?.error?.message || error.message)).replace(/'/g, "\\'");
     res.send(`
       <!DOCTYPE html>
@@ -3551,7 +3559,6 @@ app.get('/login/tokeninfo/facebook-pages', (req, res) => {
     res.status(401).json({ failed: true, error: 'Invalid or expired token' });
   }
 });
-
 
 
 
