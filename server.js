@@ -3272,7 +3272,7 @@ const CONFIG_FACEBOOK_PAGES = {
   DEFAULT_CONFIG_ID: process.env.FACEBOOK_BUSINESS_LOGIN_CONFIG_ID,
   DEFAULT_DOMAIN: process.env.COMPANION_DOMAIN,
   JWT_SECRET: process.env.COMPANION_SECRET,
-  TOKEN_EXPIRY: '10m', 
+  TOKEN_EXPIRY: '15m', 
   COOKIE_NAME: 'facebook_pages_state'
 };
 
@@ -3372,7 +3372,7 @@ app.get('/login/facebook-pages/oauth', async (req, res) => {
     httpOnly: true,
     secure: true,
     sameSite: 'none',
-    maxAge: 120000
+    maxAge: 900000
   });
 
   // Launching Facebook Login for Business using the dynamically retrieved configId
