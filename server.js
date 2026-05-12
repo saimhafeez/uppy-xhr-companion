@@ -3592,6 +3592,198 @@ app.post('/webhooks/facebook', async (req, res) => {
 });
 
 
+///////////////////////////////////////////////////
+///////////     iCal Generator    /////////////////
+///////////////////////////////////////////////////
+
+function formatIcalDate(dateString) {
+  const d = new Date(dateString);
+  return d.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
+}
+
+app.post('/generate_ical', async (req, res) => {
+  try {
+    const { 
+      title, 
+      description, 
+      start_time, 
+      end_time, 
+      organizer_name, 
+      organizer_email, 
+      attendee_name,
+      attendee_email,  // Now treated as always present
+      guests = [],     // Optional array: [{"name": "John Doe", "email": "john.doe@gmail.com"}]
+      location, 
+      member_unique_id 
+    } = req.body;
+
+    // 1. Validate required fields (attendee_email is now mandatory)
+    if (!title || !start_time || !end_time || !organizer_email || !attendee_email) {
+      return res.status(400).json({ error: "title, start_time, end_time, organizer_email, and attendee_email are required" });
+    }
+
+    const eventUniqueId = randomUUID(); // This ID represents the EVENT
+
+    // 2. Build Attendees List
+    let attendeeLines = [];
+
+    // Always add the primary attendee
+    const mainCn = attendee_name ? `CN=${attendee_name};` : '';
+    attendeeLines.push(`ATTENDEE;CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;${mainCn}mailto:${attendee_email}`);
+
+    // Add additional guests if the array is populated
+    if (Array.isArray(guests) && guests.length > 0) {
+      guests.forEach(guest => {
+        if (guest.email) {
+          const guestCn = guest.name ? `CN=${guest.name};` : '';
+          attendeeLines.push(`ATTENDEE;CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;${guestCn}mailto:${guest.email}`);
+        }
+      });
+    }
+
+    // 3. Construct the iCal string
+    const icsContent = [
+      'BEGIN:VCALENDAR',
+      'VERSION:2.0',
+      'PRODID:-//Upward//EN',
+      'CALSCALE:GREGORIAN',
+      'METHOD:REQUEST', 
+      'BEGIN:VEVENT',
+      `UID:${eventUniqueId}`,
+      `DTSTAMP:${formatIcalDate(new Date())}`,
+      `DTSTART:${formatIcalDate(start_time)}`,
+      `DTEND:${formatIcalDate(end_time)}`,
+      `SUMMARY:${title}`,
+      `DESCRIPTION:${(description || '').replace(/\n/g, '\\n')}`,
+      location ? `LOCATION:${location}` : '',
+      `ORGANIZER;CN=${organizer_name}:mailto:${organizer_email}`,
+      ...attendeeLines, // Inject primary attendee + any guests here
+      'STATUS:CONFIRMED',
+      'SEQUENCE:0',
+      'END:VEVENT',
+      'END:VCALENDAR'
+    ].filter(Boolean).join('\r\n');
+
+    // 4. Create Buffer and Upload to Wasabi
+    const buffer = Buffer.from(icsContent, 'utf-8');
+    const base64String = buffer.toString('base64');
+
+    const wasabiConfig = await getWasabiCredentials(member_unique_id);
+    const s3Client = createS3Client(wasabiConfig);
+    const wasabiKey = `icals/${Date.now()}_${eventUniqueId}.ics`;
+
+    const command = new PutObjectCommand({
+      Bucket: wasabiConfig.bucket,
+      Key: wasabiKey,
+      Body: buffer,
+      ContentType: 'text/calendar',
+      ACL: 'public-read'
+    });
+
+    await s3Client.send(command);
+
+    const regionStr = wasabiConfig.region ? `.${wasabiConfig.region}` : '';
+    let fileUrl = wasabiConfig.endpoint.includes('wasabisys.com') 
+      ? `https://${wasabiConfig.bucket}.s3${regionStr}.wasabisys.com/${wasabiKey}`
+      : `${wasabiConfig.endpoint}/${wasabiConfig.bucket}/${wasabiKey}`;
+
+    res.status(200).json({
+      ok: true,
+      event_unique_id: eventUniqueId,
+      file_url: fileUrl,
+      base64: base64String
+    });
+
+  } catch (error) {
+    console.error('iCal Generation Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+///////////////////////////////////////////////////
+//////  SendGrid Inbound Parse (RSVP Webhook) /////
+///////////////////////////////////////////////////
+
+app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
+  res.status(200).send('OK'); // Acknowledge immediately
+
+  const form = new formidable.IncomingForm({
+    multiples: true,
+    keepExtensions: true,
+  });
+
+  form.parse(req, async (err, fields, files) => {
+    if (err) {
+      console.error('Error parsing SendGrid webhook:', err);
+      return;
+    }
+
+    try {
+      // 1. Extract the Sender's Email (The Guest who clicked RSVP)
+      let senderEmail = '';
+      if (fields.from) {
+        const fromField = Array.isArray(fields.from) ? fields.from[0] : fields.from;
+        // Extracts "john@gmail.com" from "John Doe <john@gmail.com>"
+        const emailMatch = fromField.match(/<([^>]+)>/) || fromField.match(/([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z0-9_-]+)/);
+        senderEmail = emailMatch ? emailMatch[1].trim().toLowerCase() : fromField.trim().toLowerCase();
+      }
+
+      // 2. Find the .ics attachment in the incoming email
+      let icsFilepath = null;
+      for (const key of Object.keys(files)) {
+        const fileObj = Array.isArray(files[key]) ? files[key][0] : files[key];
+        if (fileObj.originalFilename && fileObj.originalFilename.toLowerCase().endsWith('.ics')) {
+          icsFilepath = fileObj.filepath;
+          break;
+        }
+      }
+
+      if (!icsFilepath) {
+        console.log(`No .ics attachment found in inbound email from ${senderEmail}. Ignoring.`);
+        return;
+      }
+
+      // 3. Read the .ics file content
+      const fileContent = await fs.readFile(icsFilepath, 'utf8');
+      
+      // Extract the UID (Event ID) and the PARTSTAT (User's answer)
+      const uidMatch = fileContent.match(/UID:(.+)/i);
+      const partstatMatch = fileContent.match(/PARTSTAT=([A-Z-]+)/i);
+
+      if (!uidMatch || !partstatMatch) {
+        console.log('Could not find UID or PARTSTAT in the reply .ics file.');
+        await fs.unlink(icsFilepath).catch(() => {});
+        return;
+      }
+
+      const unique_id = uidMatch[1].trim();
+      const status = partstatMatch[1].trim().toLowerCase(); // 'accepted', 'declined', 'tentative'
+
+      console.log(`Received RSVP: ${status} for Event UID: ${unique_id} from Guest: ${senderEmail}`);
+
+      // 4. Forward both Event ID and Guest Email to Bubble
+      const BUBBLE_RSVP_ENDPOINT = "https://upward.page/version-test/api/1.1/wf/update_ical_rsvp";
+      
+      await fetch(BUBBLE_RSVP_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          event_unique_id: unique_id,
+          status: status,
+          attendee_email: senderEmail
+        })
+      });
+
+      // Cleanup the temp file
+      await fs.unlink(icsFilepath).catch(() => {});
+
+    } catch (error) {
+      console.error('Error processing inbound RSVP:', error);
+    }
+  });
+});
 
 
 
