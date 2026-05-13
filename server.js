@@ -3725,24 +3725,23 @@ app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
     }
 
     try {
-      // 1. Extract the Sender's Email
-      let senderEmail = '';
+      // 1. Extract the Sender's Email from the header (Fallback)
+      let headerSenderEmail = '';
       if (fields.from) {
         const fromField = Array.isArray(fields.from) ? fields.from[0] : fields.from;
         const emailMatch = fromField.match(/<([^>]+)>/) || fromField.match(/([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z0-9_-]+)/);
-        senderEmail = emailMatch ? emailMatch[1].trim().toLowerCase() : fromField.trim().toLowerCase();
+        headerSenderEmail = emailMatch ? emailMatch[1].trim().toLowerCase() : fromField.trim().toLowerCase();
       }
 
       let icsContent = null;
       let filepathToCleanup = null;
 
-      // 2. Try to find the calendar data in attachments (Relaxed for Outlook)
+      // 2. Try to find the calendar data in attachments
       for (const key of Object.keys(files)) {
         const fileObj = Array.isArray(files[key]) ? files[key][0] : files[key];
         const filename = (fileObj.originalFilename || '').toLowerCase();
         const mimetype = (fileObj.mimetype || '').toLowerCase();
 
-        // Check for .ics, .vcs, or calendar mime types
         if (filename.endsWith('.ics') || filename.endsWith('.vcs') || mimetype.includes('calendar')) {
           filepathToCleanup = fileObj.filepath;
           icsContent = await fs.readFile(fileObj.filepath, 'utf8');
@@ -3750,12 +3749,10 @@ app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
         }
       }
 
-      // 3. Fallback: Outlook sometimes sends RSVPs inline. 
-      // SendGrid might put this data into the text fields instead of files.
+      // 3. Fallback: Check text fields if Outlook sent it inline
       if (!icsContent) {
         for (const key of Object.keys(fields)) {
           const val = Array.isArray(fields[key]) ? fields[key][0] : fields[key];
-          // If any text field contains standard iCal syntax, grab it
           if (typeof val === 'string' && val.includes('BEGIN:VCALENDAR') && val.includes('UID:')) {
             icsContent = val;
             break;
@@ -3763,26 +3760,34 @@ app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
         }
       }
 
-      // 4. If we still have nothing, log it and exit
       if (!icsContent) {
-        console.log(`No iCal data found in email from ${senderEmail}. Ignoring.`);
+        console.log(`No iCal data found in email from ${headerSenderEmail}. Ignoring.`);
         return;
       }
       
-      // 5. Extract the UID and the PARTSTAT (User's answer)
+      // 4. Extract the UID and the PARTSTAT
       const uidMatch = icsContent.match(/UID:(.+)/i);
       const partstatMatch = icsContent.match(/PARTSTAT=([A-Z-]+)/i);
 
       if (!uidMatch || !partstatMatch) {
-        console.log(`Could not find UID or PARTSTAT in the reply from ${senderEmail}.`);
+        console.log(`Could not find UID or PARTSTAT in the reply from ${headerSenderEmail}.`);
         if (filepathToCleanup) await fs.unlink(filepathToCleanup).catch(() => {});
         return;
       }
 
       const unique_id = uidMatch[1].trim();
-      const status = partstatMatch[1].trim().toLowerCase(); // 'accepted', 'declined', 'tentative'
+      const status = partstatMatch[1].trim().toLowerCase();
 
-      console.log(`Received RSVP: ${status} for Event UID: ${unique_id} from Guest: ${senderEmail}`);
+      // 5. EXTRACT REAL EMAIL FROM iCAL DATA (Fixes the outlook_xxxx@outlook.com bug)
+      let finalAttendeeEmail = headerSenderEmail;
+      const attendeeMatch = icsContent.match(/ATTENDEE.*?[mM][aA][iI][lL][tT][oO]:([^\s\r\n]+)/i);
+      if (attendeeMatch && attendeeMatch[1]) {
+        const extractedEmail = attendeeMatch[1].trim().toLowerCase();
+        // Use this extracted email, as it's the exact email the calendar system recognizes
+        finalAttendeeEmail = extractedEmail;
+      }
+
+      console.log(`Received RSVP: ${status} for Event UID: ${unique_id} from Guest: ${finalAttendeeEmail}`);
 
       // 6. Forward to Bubble
       const BUBBLE_RSVP_ENDPOINT = "https://mymarketing-80098.bubbleapps.io/version-test/api/1.1/wf/update_ical_rsvp/initialize";
@@ -3793,11 +3798,11 @@ app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
         body: JSON.stringify({
           event_unique_id: unique_id,
           status: status,
-          attendee_email: senderEmail
+          attendee_email: finalAttendeeEmail
         })
       });
 
-      // 7. Cleanup the temp file if there was one
+      // 7. Cleanup
       if (filepathToCleanup) {
         await fs.unlink(filepathToCleanup).catch(() => {});
       }
