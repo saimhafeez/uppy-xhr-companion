@@ -3597,6 +3597,7 @@ app.post('/webhooks/facebook', async (req, res) => {
 ///////////     iCal Generator    /////////////////
 ///////////////////////////////////////////////////
 
+// Helper function to format dates to iCal standard (YYYYMMDDThhmmssZ)
 function formatIcalDate(dateString) {
   const d = new Date(dateString);
   return d.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
@@ -3610,34 +3611,34 @@ app.post('/generate_ical', async (req, res) => {
       start_time, 
       end_time, 
       organizer_name, 
-      organizer_email, 
+      organizer_email, // E.g., rsvp@events.upward.page
       attendee_name,
-      attendee_email,  // Now treated as always present
-      guests = [],     // Optional array: [{"name": "John Doe", "email": "john.doe@gmail.com"}]
+      attendee_email,  // Primary attendee
+      guests = [],     // Optional array of additional guests: [{"name": "John", "email": "john@example.com"}]
       location, 
       member_unique_id 
     } = req.body;
 
-    // 1. Validate required fields (attendee_email is now mandatory)
+    // 1. Validate required fields
     if (!title || !start_time || !end_time || !organizer_email || !attendee_email) {
       return res.status(400).json({ error: "title, start_time, end_time, organizer_email, and attendee_email are required" });
     }
 
-    const eventUniqueId = randomUUID(); // This ID represents the EVENT
+    const eventUniqueId = randomUUID(); // This ID represents the specific EVENT
 
-    // 2. Build Attendees List
+    // 2. Build Attendees List with CORRECT iCal Syntax (Using colon before mailto:)
     let attendeeLines = [];
 
     // Always add the primary attendee
-    const mainCn = attendee_name ? `CN=${attendee_name};` : '';
-    attendeeLines.push(`ATTENDEE;CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;${mainCn}mailto:${attendee_email}`);
+    const mainCnPrefix = attendee_name ? `;CN=${attendee_name}:` : ':';
+    attendeeLines.push(`ATTENDEE;CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE${mainCnPrefix}mailto:${attendee_email}`);
 
     // Add additional guests if the array is populated
     if (Array.isArray(guests) && guests.length > 0) {
       guests.forEach(guest => {
         if (guest.email) {
-          const guestCn = guest.name ? `CN=${guest.name};` : '';
-          attendeeLines.push(`ATTENDEE;CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;${guestCn}mailto:${guest.email}`);
+          const guestCnPrefix = guest.name ? `;CN=${guest.name}:` : ':';
+          attendeeLines.push(`ATTENDEE;CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE${guestCnPrefix}mailto:${guest.email}`);
         }
       });
     }
@@ -3688,6 +3689,7 @@ app.post('/generate_ical', async (req, res) => {
       ? `https://${wasabiConfig.bucket}.s3${regionStr}.wasabisys.com/${wasabiKey}`
       : `${wasabiConfig.endpoint}/${wasabiConfig.bucket}/${wasabiKey}`;
 
+    // 5. Send response
     res.status(200).json({
       ok: true,
       event_unique_id: eventUniqueId,
@@ -3700,6 +3702,7 @@ app.post('/generate_ical', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
 
 
 
