@@ -3725,6 +3725,8 @@ app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
     }
 
     try {
+      console.log('=== INBOUND WEBHOOK FIRED ===');
+
       // 1. Extract the Sender's Email from the header (Fallback)
       let headerSenderEmail = '';
       if (fields.from) {
@@ -3765,6 +3767,14 @@ app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
         return;
       }
       
+      // CRITICAL FIX: "Unfold" the iCal lines. 
+      // iCal splits long lines with a line break followed by a space or tab. We must merge them back.
+      icsContent = icsContent.replace(/\r?\n[ \t]/g, '');
+
+      console.log('--- RAW ICS CONTENT START ---');
+      console.log(icsContent);
+      console.log('--- RAW ICS CONTENT END ---');
+
       // 4. Extract the UID and the PARTSTAT
       const uidMatch = icsContent.match(/UID:(.+)/i);
       const partstatMatch = icsContent.match(/PARTSTAT=([A-Z-]+)/i);
@@ -3778,16 +3788,28 @@ app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
       const unique_id = uidMatch[1].trim();
       const status = partstatMatch[1].trim().toLowerCase();
 
-      // 5. EXTRACT REAL EMAIL FROM iCAL DATA (Fixes the outlook_xxxx@outlook.com bug)
+      // 5. EXTRACT REAL EMAIL FROM iCAL DATA
       let finalAttendeeEmail = headerSenderEmail;
-      const attendeeMatch = icsContent.match(/ATTENDEE.*?[mM][aA][iI][lL][tT][oO]:([^\s\r\n]+)/i);
+      
+      // Extract from mailto: keeping in mind it might now be unbroken
+      const attendeeMatch = icsContent.match(/ATTENDEE.*?[mM][aA][iI][lL][tT][oO]:([^\s;]+)/i);
+      
       if (attendeeMatch && attendeeMatch[1]) {
-        const extractedEmail = attendeeMatch[1].trim().toLowerCase();
-        // Use this extracted email, as it's the exact email the calendar system recognizes
+        let extractedEmail = attendeeMatch[1].trim().toLowerCase();
+        
+        // Sometimes email clients append extra parameters or quotes, clean it up
+        extractedEmail = extractedEmail.replace(/["']/g, ''); 
+        
+        console.log(`[DEBUG] Extracted email from mailto tag: ${extractedEmail}`);
+        
+        // If Microsoft put the weird outlook address in the mailto, we log it, but we have to use it
+        // because that is what Microsoft sent us.
         finalAttendeeEmail = extractedEmail;
+      } else {
+        console.log(`[DEBUG] Could not find mailto: tag. Falling back to Header Email: ${headerSenderEmail}`);
       }
 
-      console.log(`Received RSVP: ${status} for Event UID: ${unique_id} from Guest: ${finalAttendeeEmail}`);
+      console.log(`>>> FINAL PAYLOAD TO BUBBLE: RSVP ${status} | UID ${unique_id} | EMAIL ${finalAttendeeEmail} <<<`);
 
       // 6. Forward to Bubble
       const BUBBLE_RSVP_ENDPOINT = "https://mymarketing-80098.bubbleapps.io/version-test/api/1.1/wf/update_ical_rsvp/initialize";
