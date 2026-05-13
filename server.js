@@ -3731,6 +3731,8 @@ app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
         senderEmail = emailMatch ? emailMatch[1].trim().toLowerCase() : fromField.trim().toLowerCase();
       }
 
+      console.log(`senderEmail: ${senderEmail}`);
+
       // 2. Find the .ics attachment in the incoming email
       let icsFilepath = null;
       for (const key of Object.keys(files)) {
