@@ -3725,42 +3725,57 @@ app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
     }
 
     try {
-      // 1. Extract the Sender's Email (The Guest who clicked RSVP)
+      // 1. Extract the Sender's Email
       let senderEmail = '';
       if (fields.from) {
         const fromField = Array.isArray(fields.from) ? fields.from[0] : fields.from;
-        // Extracts "john@gmail.com" from "John Doe <john@gmail.com>"
         const emailMatch = fromField.match(/<([^>]+)>/) || fromField.match(/([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z0-9_-]+)/);
         senderEmail = emailMatch ? emailMatch[1].trim().toLowerCase() : fromField.trim().toLowerCase();
       }
 
-      console.log(`senderEmail: ${senderEmail}`);
+      let icsContent = null;
+      let filepathToCleanup = null;
 
-      // 2. Find the .ics attachment in the incoming email
-      let icsFilepath = null;
+      // 2. Try to find the calendar data in attachments (Relaxed for Outlook)
       for (const key of Object.keys(files)) {
         const fileObj = Array.isArray(files[key]) ? files[key][0] : files[key];
-        if (fileObj.originalFilename && fileObj.originalFilename.toLowerCase().endsWith('.ics')) {
-          icsFilepath = fileObj.filepath;
+        const filename = (fileObj.originalFilename || '').toLowerCase();
+        const mimetype = (fileObj.mimetype || '').toLowerCase();
+
+        // Check for .ics, .vcs, or calendar mime types
+        if (filename.endsWith('.ics') || filename.endsWith('.vcs') || mimetype.includes('calendar')) {
+          filepathToCleanup = fileObj.filepath;
+          icsContent = await fs.readFile(fileObj.filepath, 'utf8');
           break;
         }
       }
 
-      if (!icsFilepath) {
-        console.log(`No .ics attachment found in inbound email from ${senderEmail}. Ignoring.`);
-        return;
+      // 3. Fallback: Outlook sometimes sends RSVPs inline. 
+      // SendGrid might put this data into the text fields instead of files.
+      if (!icsContent) {
+        for (const key of Object.keys(fields)) {
+          const val = Array.isArray(fields[key]) ? fields[key][0] : fields[key];
+          // If any text field contains standard iCal syntax, grab it
+          if (typeof val === 'string' && val.includes('BEGIN:VCALENDAR') && val.includes('UID:')) {
+            icsContent = val;
+            break;
+          }
+        }
       }
 
-      // 3. Read the .ics file content
-      const fileContent = await fs.readFile(icsFilepath, 'utf8');
+      // 4. If we still have nothing, log it and exit
+      if (!icsContent) {
+        console.log(`No iCal data found in email from ${senderEmail}. Ignoring.`);
+        return;
+      }
       
-      // Extract the UID (Event ID) and the PARTSTAT (User's answer)
-      const uidMatch = fileContent.match(/UID:(.+)/i);
-      const partstatMatch = fileContent.match(/PARTSTAT=([A-Z-]+)/i);
+      // 5. Extract the UID and the PARTSTAT (User's answer)
+      const uidMatch = icsContent.match(/UID:(.+)/i);
+      const partstatMatch = icsContent.match(/PARTSTAT=([A-Z-]+)/i);
 
       if (!uidMatch || !partstatMatch) {
-        console.log('Could not find UID or PARTSTAT in the reply .ics file.');
-        await fs.unlink(icsFilepath).catch(() => {});
+        console.log(`Could not find UID or PARTSTAT in the reply from ${senderEmail}.`);
+        if (filepathToCleanup) await fs.unlink(filepathToCleanup).catch(() => {});
         return;
       }
 
@@ -3769,8 +3784,8 @@ app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
 
       console.log(`Received RSVP: ${status} for Event UID: ${unique_id} from Guest: ${senderEmail}`);
 
-      // 4. Forward both Event ID and Guest Email to Bubble
-      const BUBBLE_RSVP_ENDPOINT = "https://upward.page/version-test/api/1.1/wf/update_ical_rsvp/initialize";
+      // 6. Forward to Bubble
+      const BUBBLE_RSVP_ENDPOINT = "https://upward.page/api/1.1/wf/update_ical_rsvp";
       
       await fetch(BUBBLE_RSVP_ENDPOINT, {
         method: "POST",
@@ -3782,8 +3797,10 @@ app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
         })
       });
 
-      // Cleanup the temp file
-      await fs.unlink(icsFilepath).catch(() => {});
+      // 7. Cleanup the temp file if there was one
+      if (filepathToCleanup) {
+        await fs.unlink(filepathToCleanup).catch(() => {});
+      }
 
     } catch (error) {
       console.error('Error processing inbound RSVP:', error);
