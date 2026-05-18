@@ -3611,29 +3611,26 @@ app.post('/generate_ical', async (req, res) => {
       start_time, 
       end_time, 
       organizer_name, 
-      organizer_email, // E.g., rsvp@events.upward.page
+      organizer_email, 
       attendee_name,
-      attendee_email,  // Primary attendee
-      guests = [],     // Optional array of additional guests: [{"name": "John", "email": "john@example.com"}]
+      attendee_email,  
+      guests = [],     
       location, 
-      member_unique_id 
+      member_unique_id,
+      booking_unique_id // <-- Passed from Frontend
     } = req.body;
 
     // 1. Validate required fields
-    if (!title || !start_time || !end_time || !organizer_email || !attendee_email) {
-      return res.status(400).json({ error: "title, start_time, end_time, organizer_email, and attendee_email are required" });
+    if (!title || !start_time || !end_time || !organizer_email || !attendee_email || !booking_unique_id) {
+      return res.status(400).json({ error: "title, start_time, end_time, organizer_email, attendee_email, and booking_unique_id are required" });
     }
-
-    const eventUniqueId = randomUUID(); // This ID represents the specific EVENT
 
     // 2. Build Attendees List with CORRECT iCal Syntax (Using colon before mailto:)
     let attendeeLines = [];
 
-    // Always add the primary attendee
     const mainCnPrefix = attendee_name ? `;CN=${attendee_name}:` : ':';
     attendeeLines.push(`ATTENDEE;CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE${mainCnPrefix}mailto:${attendee_email}`);
 
-    // Add additional guests if the array is populated
     if (Array.isArray(guests) && guests.length > 0) {
       guests.forEach(guest => {
         if (guest.email) {
@@ -3643,7 +3640,7 @@ app.post('/generate_ical', async (req, res) => {
       });
     }
 
-    // 3. Construct the iCal string
+    // 3. Construct the iCal string using booking_unique_id
     const icsContent = [
       'BEGIN:VCALENDAR',
       'VERSION:2.0',
@@ -3651,7 +3648,7 @@ app.post('/generate_ical', async (req, res) => {
       'CALSCALE:GREGORIAN',
       'METHOD:REQUEST', 
       'BEGIN:VEVENT',
-      `UID:${eventUniqueId}`,
+      `UID:${booking_unique_id}`,
       `DTSTAMP:${formatIcalDate(new Date())}`,
       `DTSTART:${formatIcalDate(start_time)}`,
       `DTEND:${formatIcalDate(end_time)}`,
@@ -3659,7 +3656,7 @@ app.post('/generate_ical', async (req, res) => {
       `DESCRIPTION:${(description || '').replace(/\n/g, '\\n')}`,
       location ? `LOCATION:${location}` : '',
       `ORGANIZER;CN=${organizer_name}:mailto:${organizer_email}`,
-      ...attendeeLines, // Inject primary attendee + any guests here
+      ...attendeeLines, 
       'STATUS:CONFIRMED',
       'SEQUENCE:0',
       'END:VEVENT',
@@ -3672,7 +3669,7 @@ app.post('/generate_ical', async (req, res) => {
 
     const wasabiConfig = await getWasabiCredentials(member_unique_id);
     const s3Client = createS3Client(wasabiConfig);
-    const wasabiKey = `icals/${Date.now()}_${eventUniqueId}.ics`;
+    const wasabiKey = `icals/${Date.now()}_${booking_unique_id}.ics`;
 
     const command = new PutObjectCommand({
       Bucket: wasabiConfig.bucket,
@@ -3692,7 +3689,7 @@ app.post('/generate_ical', async (req, res) => {
     // 5. Send response
     res.status(200).json({
       ok: true,
-      event_unique_id: eventUniqueId,
+      booking_unique_id: booking_unique_id,
       file_url: fileUrl,
       base64: base64String
     });
@@ -3702,8 +3699,6 @@ app.post('/generate_ical', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
-
-
 
 
 ///////////////////////////////////////////////////
@@ -3811,18 +3806,20 @@ app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
 
       console.log(`>>> FINAL PAYLOAD TO BUBBLE: RSVP ${status} | UID ${unique_id} | EMAIL ${finalAttendeeEmail} <<<`);
 
-      // 6. Forward to Bubble
-      const BUBBLE_RSVP_ENDPOINT = "https://mymarketing-80098.bubbleapps.io/version-test/api/1.1/wf/update_ical_rsvp/initialize";
+            // 6. Forward to Bubble
+      const BUBBLE_RSVP_ENDPOINT = "https://upward.page/api/1.1/wf/update_ical_rsvp";
       
       await fetch(BUBBLE_RSVP_ENDPOINT, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          event_unique_id: unique_id,
+          booking_unique_id: unique_id,
           status: status,
-          attendee_email: finalAttendeeEmail
+          attendee_email: finalAttendeeEmail,
+          attendee_name: finalAttendeeName  
         })
       });
+
 
       // 7. Cleanup
       if (filepathToCleanup) {
