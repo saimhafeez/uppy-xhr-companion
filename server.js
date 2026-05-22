@@ -3617,7 +3617,8 @@ app.post('/generate_ical', async (req, res) => {
       guests = [],     
       location, 
       member_unique_id,
-      booking_unique_id // <-- Passed from Frontend
+      booking_unique_id,
+      method = 'REQUEST' // Defaults to REQUEST if not provided
     } = req.body;
 
     // 1. Validate required fields
@@ -3625,7 +3626,13 @@ app.post('/generate_ical', async (req, res) => {
       return res.status(400).json({ error: "title, start_time, end_time, organizer_email, attendee_email, and booking_unique_id are required" });
     }
 
-    // 2. Build Attendees List with CORRECT iCal Syntax (Using colon before mailto:)
+    // Determine the exact method and status
+    const icalMethod = method.toUpperCase() === 'CANCEL' ? 'CANCEL' : 'REQUEST';
+    const icalStatus = icalMethod === 'CANCEL' ? 'CANCELLED' : 'CONFIRMED';
+    // When cancelling/updating, bumping the sequence ensures the calendar client prioritizes this file over the old one
+    const icalSequence = icalMethod === 'CANCEL' ? '1' : '0'; 
+
+    // 2. Build Attendees List with CORRECT iCal Syntax
     let attendeeLines = [];
 
     const mainCnPrefix = attendee_name ? `;CN=${attendee_name}:` : ':';
@@ -3640,15 +3647,15 @@ app.post('/generate_ical', async (req, res) => {
       });
     }
 
-    // 3. Construct the iCal string using booking_unique_id
+    // 3. Construct the iCal string
     const icsContent = [
       'BEGIN:VCALENDAR',
       'VERSION:2.0',
       'PRODID:-//Upward//EN',
       'CALSCALE:GREGORIAN',
-      'METHOD:REQUEST', 
+      `METHOD:${icalMethod}`, // Uses REQUEST or CANCEL
       'BEGIN:VEVENT',
-      `UID:${booking_unique_id}`,
+      `UID:${booking_unique_id}`, // Calendar uses this to find the existing event
       `DTSTAMP:${formatIcalDate(new Date())}`,
       `DTSTART:${formatIcalDate(start_time)}`,
       `DTEND:${formatIcalDate(end_time)}`,
@@ -3657,8 +3664,8 @@ app.post('/generate_ical', async (req, res) => {
       location ? `LOCATION:${location}` : '',
       `ORGANIZER;CN=${organizer_name}:mailto:${organizer_email}`,
       ...attendeeLines, 
-      'STATUS:CONFIRMED',
-      'SEQUENCE:0',
+      `STATUS:${icalStatus}`, // CONFIRMED or CANCELLED
+      `SEQUENCE:${icalSequence}`, 
       'END:VEVENT',
       'END:VCALENDAR'
     ].filter(Boolean).join('\r\n');
@@ -3690,6 +3697,7 @@ app.post('/generate_ical', async (req, res) => {
     res.status(200).json({
       ok: true,
       booking_unique_id: booking_unique_id,
+      method: icalMethod,
       file_url: fileUrl,
       base64: base64String
     });
@@ -3699,6 +3707,7 @@ app.post('/generate_ical', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
 
 
 ///////////////////////////////////////////////////
