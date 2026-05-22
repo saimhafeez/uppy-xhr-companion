@@ -3709,13 +3709,12 @@ app.post('/generate_ical', async (req, res) => {
 });
 
 
-
 ///////////////////////////////////////////////////
 //////  SendGrid Inbound Parse (RSVP Webhook) /////
 ///////////////////////////////////////////////////
 
 app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
-  res.status(200).send('OK'); // Acknowledge immediately
+  res.status(200).send('OK'); // Acknowledge immediately so SendGrid doesn't retry
 
   const form = new formidable.IncomingForm({
     multiples: true,
@@ -3771,13 +3770,8 @@ app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
         return;
       }
       
-      // CRITICAL FIX: "Unfold" the iCal lines. 
-      // iCal splits long lines with a line break followed by a space or tab. We must merge them back.
+      // CRITICAL FIX: "Unfold" the iCal lines (Removes line breaks followed by space/tab)
       icsContent = icsContent.replace(/\r?\n[ \t]/g, '');
-
-      console.log('--- RAW ICS CONTENT START ---');
-      console.log(icsContent);
-      console.log('--- RAW ICS CONTENT END ---');
 
       // 4. Extract the UID and the PARTSTAT
       const uidMatch = icsContent.match(/UID:(.+)/i);
@@ -3792,43 +3786,40 @@ app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
       const unique_id = uidMatch[1].trim();
       const status = partstatMatch[1].trim().toLowerCase();
 
-      // 5. EXTRACT REAL EMAIL FROM iCAL DATA
+      // 5. EXTRACT EMAIL AND NAME FROM iCAL DATA
       let finalAttendeeEmail = headerSenderEmail;
+      let finalAttendeeName = ""; 
       
-      // Extract from mailto: keeping in mind it might now be unbroken
+      // Extract Email
       const attendeeMatch = icsContent.match(/ATTENDEE.*?[mM][aA][iI][lL][tT][oO]:([^\s;]+)/i);
-      
       if (attendeeMatch && attendeeMatch[1]) {
-        let extractedEmail = attendeeMatch[1].trim().toLowerCase();
-        
-        // Sometimes email clients append extra parameters or quotes, clean it up
-        extractedEmail = extractedEmail.replace(/["']/g, ''); 
-        
-        console.log(`[DEBUG] Extracted email from mailto tag: ${extractedEmail}`);
-        
-        // If Microsoft put the weird outlook address in the mailto, we log it, but we have to use it
-        // because that is what Microsoft sent us.
-        finalAttendeeEmail = extractedEmail;
+        finalAttendeeEmail = attendeeMatch[1].trim().toLowerCase().replace(/["']/g, '');
+        console.log(`[DEBUG] Extracted email from mailto tag: ${finalAttendeeEmail}`);
       } else {
         console.log(`[DEBUG] Could not find mailto: tag. Falling back to Header Email: ${headerSenderEmail}`);
       }
 
-      console.log(`>>> FINAL PAYLOAD TO BUBBLE: RSVP ${status} | UID ${unique_id} | EMAIL ${finalAttendeeEmail} <<<`);
+      // Extract Name (CN)
+      const cnMatch = icsContent.match(/CN=([^:;]+)/i);
+      if (cnMatch && cnMatch[1]) {
+        finalAttendeeName = cnMatch[1].trim();
+      }
 
-            // 6. Forward to Bubble
-      const BUBBLE_RSVP_ENDPOINT = "https://upward.page/version-test/api/1.1/wf/update_ical_rsvp/initialize"; 
+      console.log(`>>> FINAL PAYLOAD TO BUBBLE: RSVP ${status} | UID ${unique_id} | EMAIL ${finalAttendeeEmail} | NAME ${finalAttendeeName} <<<`);
+
+      // 6. Forward to Bubble
+      const BUBBLE_RSVP_ENDPOINT = "https://upward.page/version-test/api/1.1/wf/update_ical_rsvp/initialize";
       
       await fetch(BUBBLE_RSVP_ENDPOINT, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          booking_unique_id: unique_id,
+          booking_unique_id: unique_id, 
           status: status,
           attendee_email: finalAttendeeEmail,
           attendee_name: finalAttendeeName  
         })
       });
-
 
       // 7. Cleanup
       if (filepathToCleanup) {
@@ -3840,8 +3831,6 @@ app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
     }
   });
 });
-
-
 
 
 ///////////////////////////////////////////////////
