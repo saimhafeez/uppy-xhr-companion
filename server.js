@@ -3618,44 +3618,48 @@ app.post('/generate_ical', async (req, res) => {
       location, 
       member_unique_id,
       booking_unique_id,
-      method = 'REQUEST' // Defaults to REQUEST if not provided
+      method = 'REQUEST', // 'REQUEST', 'CANCEL', or 'REPLY'
+      attendee_status = 'NEEDS-ACTION', // 'NEEDS-ACTION', 'ACCEPTED', 'DECLINED'
+      sequence 
     } = req.body;
 
-    // 1. Validate required fields
-    if (!title || !start_time || !end_time || !organizer_email || !attendee_email || !booking_unique_id) {
-      return res.status(400).json({ error: "title, start_time, end_time, organizer_email, attendee_email, and booking_unique_id are required" });
+    if (!title || !start_time || !end_time || !organizer_email || !booking_unique_id) {
+      return res.status(400).json({ error: "title, start_time, end_time, organizer_email, and booking_unique_id are required" });
     }
 
-    // Determine the exact method and status
-    const icalMethod = method.toUpperCase() === 'CANCEL' ? 'CANCEL' : 'REQUEST';
+    const icalMethod = method.toUpperCase();
     const icalStatus = icalMethod === 'CANCEL' ? 'CANCELLED' : 'CONFIRMED';
-    // When cancelling/updating, bumping the sequence ensures the calendar client prioritizes this file over the old one
-    const icalSequence = icalMethod === 'CANCEL' ? '1' : '0'; 
+    const icalSequence = sequence !== undefined ? sequence : (icalMethod === 'CANCEL' ? '1' : '0'); 
+    const partStat = attendee_status.toUpperCase();
 
-    // 2. Build Attendees List with CORRECT iCal Syntax
+    // Build Attendees List
     let attendeeLines = [];
 
-    const mainCnPrefix = attendee_name ? `;CN=${attendee_name}:` : ':';
-    attendeeLines.push(`ATTENDEE;CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE${mainCnPrefix}mailto:${attendee_email}`);
+    // Add primary attendee
+    if (attendee_email) {
+      const mainCnPrefix = attendee_name ? `;CN=${attendee_name}:` : ':';
+      attendeeLines.push(`ATTENDEE;CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT=${partStat};RSVP=TRUE${mainCnPrefix}mailto:${attendee_email}`);
+    }
 
+    // Add guests
     if (Array.isArray(guests) && guests.length > 0) {
       guests.forEach(guest => {
         if (guest.email) {
           const guestCnPrefix = guest.name ? `;CN=${guest.name}:` : ':';
-          attendeeLines.push(`ATTENDEE;CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE${guestCnPrefix}mailto:${guest.email}`);
+          attendeeLines.push(`ATTENDEE;CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT=${partStat};RSVP=TRUE${guestCnPrefix}mailto:${guest.email}`);
         }
       });
     }
 
-    // 3. Construct the iCal string
+    // Construct the iCal string
     const icsContent = [
       'BEGIN:VCALENDAR',
       'VERSION:2.0',
       'PRODID:-//Upward//EN',
       'CALSCALE:GREGORIAN',
-      `METHOD:${icalMethod}`, // Uses REQUEST or CANCEL
+      `METHOD:${icalMethod}`, 
       'BEGIN:VEVENT',
-      `UID:${booking_unique_id}`, // Calendar uses this to find the existing event
+      `UID:${booking_unique_id}`, 
       `DTSTAMP:${formatIcalDate(new Date())}`,
       `DTSTART:${formatIcalDate(start_time)}`,
       `DTEND:${formatIcalDate(end_time)}`,
@@ -3664,13 +3668,13 @@ app.post('/generate_ical', async (req, res) => {
       location ? `LOCATION:${location}` : '',
       `ORGANIZER;CN=${organizer_name}:mailto:${organizer_email}`,
       ...attendeeLines, 
-      `STATUS:${icalStatus}`, // CONFIRMED or CANCELLED
+      `STATUS:${icalStatus}`, 
       `SEQUENCE:${icalSequence}`, 
       'END:VEVENT',
       'END:VCALENDAR'
     ].filter(Boolean).join('\r\n');
 
-    // 4. Create Buffer and Upload to Wasabi
+    // Create Buffer and Upload
     const buffer = Buffer.from(icsContent, 'utf-8');
     const base64String = buffer.toString('base64');
 
@@ -3693,11 +3697,11 @@ app.post('/generate_ical', async (req, res) => {
       ? `https://${wasabiConfig.bucket}.s3${regionStr}.wasabisys.com/${wasabiKey}`
       : `${wasabiConfig.endpoint}/${wasabiConfig.bucket}/${wasabiKey}`;
 
-    // 5. Send response
     res.status(200).json({
       ok: true,
       booking_unique_id: booking_unique_id,
       method: icalMethod,
+      sequence: icalSequence,
       file_url: fileUrl,
       base64: base64String
     });
@@ -3707,6 +3711,7 @@ app.post('/generate_ical', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
 
 
 ///////////////////////////////////////////////////
