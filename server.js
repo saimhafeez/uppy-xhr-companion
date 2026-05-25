@@ -3808,7 +3808,7 @@ app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
       console.log(`>>> FINAL PAYLOAD TO BUBBLE: RSVP ${status} | UID ${unique_id} | EMAIL ${finalAttendeeEmail} | NAME ${finalAttendeeName} <<<`);
 
       // 6. Forward to Bubble
-      const BUBBLE_RSVP_ENDPOINT = "https://mymarketing-80098.bubbleapps.io/version-test/api/1.1/wf/update_ical_rsvp/initialize"; //https://mymarketing-80098.bubbleapps.io/version-test/api/1.1/wf/calendar_rsvp_webhook/initialize
+      const BUBBLE_RSVP_ENDPOINT = "https://upward.page/version-test/api/1.1/wf/update_ical_rsvp";
       
       await fetch(BUBBLE_RSVP_ENDPOINT, {
         method: "POST",
