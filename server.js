@@ -3597,32 +3597,18 @@ app.post('/webhooks/facebook', async (req, res) => {
 ///////////     iCal Generator    /////////////////
 ///////////////////////////////////////////////////
 
-// Helper function to format dates to iCal standard (YYYYMMDDThhmmss)
-function formatIcalDate(dateString, timeZone) {
-  const d = new Date(dateString);
-  
-  if (timeZone) {
-    // Format the date in the specific local timezone (No 'Z' at the end)
-    const formatter = new Intl.DateTimeFormat('en-US', {
-      timeZone: timeZone,
-      year: 'numeric', month: '2-digit', day: '2-digit',
-      hour: '2-digit', minute: '2-digit', second: '2-digit',
-      hour12: false
-    });
-    
-    const parts = formatter.formatToParts(d);
-    const p = {};
-    parts.forEach(part => p[part.type] = part.value);
-    
-    // Safety check for older Node environments converting midnight to '24'
-    let hour = p.hour;
-    if (hour === '24') hour = '00';
+// Helper for DTSTAMP (Always needs to be current time in UTC)
+function getCurrentIcalUtc() {
+  return new Date().toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
+}
 
-    return `${p.year}${p.month}${p.day}T${hour}${p.minute}${p.second}`;
-  } else {
-    // Default UTC format (Ends with 'Z')
-    return d.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
-  }
+// Helper to keep the EXACT time passed from Bubble without any JS timezone shifting
+function formatExactLocalTime(dateString) {
+  // 1. Remove hyphens and colons
+  let cleaned = dateString.replace(/[-:]/g, '');
+  // 2. Remove decimals/milliseconds and the trailing 'Z' if present
+  cleaned = cleaned.split('.')[0].replace('Z', '');
+  return cleaned; // Returns exactly like: 20260529T090000
 }
 
 app.post('/generate_ical', async (req, res) => {
@@ -3640,10 +3626,10 @@ app.post('/generate_ical', async (req, res) => {
       location, 
       member_unique_id,
       booking_unique_id,
-      method = 'REQUEST', // 'REQUEST', 'CANCEL', or 'REPLY'
-      attendee_status = 'NEEDS-ACTION', // 'NEEDS-ACTION', 'ACCEPTED', 'DECLINED'
+      method = 'REQUEST', 
+      attendee_status = 'NEEDS-ACTION', 
       sequence,
-      timezone_id // <-- Added Timezone ID
+      timezone_id // e.g., "Asia/Tashkent"
     } = req.body;
 
     if (!title || !start_time || !end_time || !organizer_email || !booking_unique_id) {
@@ -3658,13 +3644,11 @@ app.post('/generate_ical', async (req, res) => {
     // Build Attendees List
     let attendeeLines = [];
 
-    // Add primary attendee
     if (attendee_email) {
       const mainCnPrefix = attendee_name ? `;CN=${attendee_name}:` : ':';
       attendeeLines.push(`ATTENDEE;CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT=${partStat};RSVP=TRUE${mainCnPrefix}mailto:${attendee_email}`);
     }
 
-    // Add guests
     if (Array.isArray(guests) && guests.length > 0) {
       guests.forEach(guest => {
         if (guest.email) {
@@ -3675,13 +3659,14 @@ app.post('/generate_ical', async (req, res) => {
     }
 
     // Determine DTSTART and DTEND lines based on timezone presence
+    // Uses the EXACT string passed in (no Javascript time shifting)
     const dtStartLine = timezone_id 
-      ? `DTSTART;TZID=${timezone_id}:${formatIcalDate(start_time, timezone_id)}`
-      : `DTSTART:${formatIcalDate(start_time)}`;
+      ? `DTSTART;TZID=${timezone_id}:${formatExactLocalTime(start_time)}`
+      : `DTSTART:${formatExactLocalTime(start_time)}Z`; // Fallback to UTC format if no timezone
       
     const dtEndLine = timezone_id 
-      ? `DTEND;TZID=${timezone_id}:${formatIcalDate(end_time, timezone_id)}`
-      : `DTEND:${formatIcalDate(end_time)}`;
+      ? `DTEND;TZID=${timezone_id}:${formatExactLocalTime(end_time)}`
+      : `DTEND:${formatExactLocalTime(end_time)}Z`;
 
     // Construct the iCal string
     const icsContent = [
@@ -3692,7 +3677,7 @@ app.post('/generate_ical', async (req, res) => {
       `METHOD:${icalMethod}`, 
       'BEGIN:VEVENT',
       `UID:${booking_unique_id}`, 
-      `DTSTAMP:${formatIcalDate(new Date())}`, // Always UTC (no timezone passed)
+      `DTSTAMP:${getCurrentIcalUtc()}`, // DTSTAMP must remain current UTC time
       dtStartLine,
       dtEndLine,
       `SUMMARY:${title}`,
@@ -3743,6 +3728,7 @@ app.post('/generate_ical', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
 
 
 
