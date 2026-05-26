@@ -3597,10 +3597,32 @@ app.post('/webhooks/facebook', async (req, res) => {
 ///////////     iCal Generator    /////////////////
 ///////////////////////////////////////////////////
 
-// Helper function to format dates to iCal standard (YYYYMMDDThhmmssZ)
-function formatIcalDate(dateString) {
+// Helper function to format dates to iCal standard (YYYYMMDDThhmmss)
+function formatIcalDate(dateString, timeZone) {
   const d = new Date(dateString);
-  return d.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
+  
+  if (timeZone) {
+    // Format the date in the specific local timezone (No 'Z' at the end)
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: timeZone,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+      hour12: false
+    });
+    
+    const parts = formatter.formatToParts(d);
+    const p = {};
+    parts.forEach(part => p[part.type] = part.value);
+    
+    // Safety check for older Node environments converting midnight to '24'
+    let hour = p.hour;
+    if (hour === '24') hour = '00';
+
+    return `${p.year}${p.month}${p.day}T${hour}${p.minute}${p.second}`;
+  } else {
+    // Default UTC format (Ends with 'Z')
+    return d.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
+  }
 }
 
 app.post('/generate_ical', async (req, res) => {
@@ -3620,7 +3642,8 @@ app.post('/generate_ical', async (req, res) => {
       booking_unique_id,
       method = 'REQUEST', // 'REQUEST', 'CANCEL', or 'REPLY'
       attendee_status = 'NEEDS-ACTION', // 'NEEDS-ACTION', 'ACCEPTED', 'DECLINED'
-      sequence 
+      sequence,
+      timezone_id // <-- Added Timezone ID
     } = req.body;
 
     if (!title || !start_time || !end_time || !organizer_email || !booking_unique_id) {
@@ -3651,6 +3674,15 @@ app.post('/generate_ical', async (req, res) => {
       });
     }
 
+    // Determine DTSTART and DTEND lines based on timezone presence
+    const dtStartLine = timezone_id 
+      ? `DTSTART;TZID=${timezone_id}:${formatIcalDate(start_time, timezone_id)}`
+      : `DTSTART:${formatIcalDate(start_time)}`;
+      
+    const dtEndLine = timezone_id 
+      ? `DTEND;TZID=${timezone_id}:${formatIcalDate(end_time, timezone_id)}`
+      : `DTEND:${formatIcalDate(end_time)}`;
+
     // Construct the iCal string
     const icsContent = [
       'BEGIN:VCALENDAR',
@@ -3660,9 +3692,9 @@ app.post('/generate_ical', async (req, res) => {
       `METHOD:${icalMethod}`, 
       'BEGIN:VEVENT',
       `UID:${booking_unique_id}`, 
-      `DTSTAMP:${formatIcalDate(new Date())}`,
-      `DTSTART:${formatIcalDate(start_time)}`,
-      `DTEND:${formatIcalDate(end_time)}`,
+      `DTSTAMP:${formatIcalDate(new Date())}`, // Always UTC (no timezone passed)
+      dtStartLine,
+      dtEndLine,
       `SUMMARY:${title}`,
       `DESCRIPTION:${(description || '').replace(/\n/g, '\\n')}`,
       location ? `LOCATION:${location}` : '',
@@ -3711,6 +3743,7 @@ app.post('/generate_ical', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
 
 
 
