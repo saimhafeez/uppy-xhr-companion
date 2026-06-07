@@ -3858,6 +3858,80 @@ app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
 
 
 ///////////////////////////////////////////////////
+///////////     Web Scraper API   /////////////////
+///////////////////////////////////////////////////
+
+const puppeteer = require('puppeteer');
+
+app.post('/api/scrape', async (req, res) => {
+  const { url } = req.body;
+
+  if (!url) {
+    return res.status(400).json({ error: "Please provide a valid URL." });
+  }
+
+  let browser;
+  try {
+    // Launch headless browser optimized for server environments
+    browser = await puppeteer.launch({
+      headless: true,
+      args: [
+        '--no-sandbox', 
+        '--disable-setuid-sandbox', 
+        '--disable-dev-shm-usage',
+        '--disable-gpu'
+      ]
+    });
+
+    const page = await browser.newPage();
+    
+    // OPTIMIZATION: Block images, CSS, and fonts to speed up the scrape and save server memory
+    await page.setRequestInterception(true);
+    page.on('request', (request) => {
+      const resourceType = request.resourceType();
+      if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
+        request.abort();
+      } else {
+        request.continue();
+      }
+    });
+
+    // Go to the URL and wait until network is mostly idle
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+
+    // Evaluate the page DOM to extract clean text
+    const pageText = await page.evaluate(() => {
+      // Remove unnecessary elements that clutter the text for the AI
+      const elementsToRemove = document.querySelectorAll('script, style, noscript, nav, footer, header, iframe, svg');
+      elementsToRemove.forEach(el => el.remove());
+
+      // Extract the visible inner text
+      let text = document.body.innerText || "";
+      
+      // Clean up excessive blank lines and spaces
+      text = text.replace(/\n\s*\n/g, '\n\n').trim();
+      return text;
+    });
+
+    await browser.close();
+
+    // Return the clean text to Bubble
+    res.status(200).json({ 
+      success: true, 
+      url: url,
+      scraped_text: pageText 
+    });
+
+  } catch (error) {
+    if (browser) await browser.close();
+    console.error("Scraping Error:", error);
+    res.status(500).json({ error: "Failed to scrape the website.", details: error.message });
+  }
+});
+
+
+
+///////////////////////////////////////////////////
 ///////////         Server        /////////////////
 ///////////////////////////////////////////////////
 
