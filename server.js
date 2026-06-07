@@ -3857,6 +3857,89 @@ app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
 });
 
 
+///////////////////////////////////////////////////
+///////////   Generate Website FAQs   /////////////
+///////////////////////////////////////////////////
+
+app.post('/api/generate-faqs', async (req, res) => {
+  const { scraped_text } = req.body;
+
+  if (!scraped_text) {
+    return res.status(400).json({ error: "Please provide scraped_text." });
+  }
+
+  // Build the OpenAI Responses API payload
+  const payload = {
+    model: "gpt-4o-mini",
+    input: [
+      {
+        role: "system",
+        content: "You are an expert knowledge-base architect. You will receive raw, scraped text from a company's website. Your job is to extract EVERY piece of useful information (what they do, pricing, features, target audience, policies, contact info) and formulate them into Frequently Asked Questions.\n\nCRITICAL FORMATTING RULES:\nYou MUST output the final result as a single continuous text string using EXACTLY these custom delimiters:\n- Use `#:#` to separate the Number, Title (Question), and Description (Answer).\n- Use `####` to separate each row (each FAQ).\n\nEXAMPLE FORMAT:\n1#:#What is your refund policy?#:#We offer a 30-day money back guarantee.####2#:#How much does the Pro plan cost?#:#The Pro plan is $49/month.\n\nDo not include any line breaks, extra spaces, or markdown outside of this exact format."
+      },
+      {
+        role: "user",
+        content: scraped_text
+      }
+    ],
+    text: {
+      format: {
+        type: "json_schema",
+        name: "website_knowledge",
+        strict: true,
+        schema: {
+          type: "object",
+          properties: {
+            faq_data: { 
+              type: "string", 
+              description: "The full list of FAQs formatted strictly with #:# and #### delimiters." 
+            }
+          },
+          required: ["faq_data"],
+          additionalProperties: false
+        }
+      }
+    }
+  };
+
+  try {
+    const openaiRes = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + process.env.OPENAI_API_KEY
+      },
+      body: JSON.stringify(payload)
+    });
+
+    if (!openaiRes.ok) {
+      const errorText = await openaiRes.text();
+      throw new Error(`OpenAI API Error: ${openaiRes.status} - ${errorText}`);
+    }
+
+    const data = await openaiRes.json();
+    
+    // Find the message output block
+    const messageOutput = data.output?.find(item => item.type === "message");
+    // Extract the raw stringified JSON text
+    const outputText = messageOutput?.content?.find(c => c.type === "output_text")?.text || "{}";
+    
+    // Parse the stringified JSON into a real JavaScript object
+    const parsedData = JSON.parse(outputText);
+
+    // Send the clean faq_data string straight back to Bubble
+    res.status(200).json({ 
+      success: true, 
+      faq_data: parsedData.faq_data || ""
+    });
+
+  } catch (error) {
+    console.error("FAQ Generation Error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
 
 ///////////////////////////////////////////////////
 ///////////         Server        /////////////////
