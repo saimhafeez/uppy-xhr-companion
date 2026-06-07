@@ -3861,7 +3861,9 @@ app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
 ///////////     Web Scraper API   /////////////////
 ///////////////////////////////////////////////////
 
-const puppeteer = require('puppeteer');
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+puppeteer.use(StealthPlugin()); // This applies the Cloudflare bypass
 
 app.post('/api/scrape', async (req, res) => {
   const { url } = req.body;
@@ -3872,20 +3874,23 @@ app.post('/api/scrape', async (req, res) => {
 
   let browser;
   try {
-    // Launch headless browser optimized for server environments
     browser = await puppeteer.launch({
       headless: true,
       args: [
         '--no-sandbox', 
         '--disable-setuid-sandbox', 
         '--disable-dev-shm-usage',
-        '--disable-gpu'
+        '--disable-gpu',
+        '--disable-blink-features=AutomationControlled' // Extra anti-bot bypass
       ]
     });
 
     const page = await browser.newPage();
+
+    // Set a real human User-Agent
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
     
-    // OPTIMIZATION: Block images, CSS, and fonts to speed up the scrape and save server memory
+    // OPTIMIZATION: Block images, CSS, and fonts
     await page.setRequestInterception(true);
     page.on('request', (request) => {
       const resourceType = request.resourceType();
@@ -3896,26 +3901,20 @@ app.post('/api/scrape', async (req, res) => {
       }
     });
 
-    // Go to the URL and wait until network is mostly idle
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+    // Wait until network is mostly idle (Cloudflare needs time to verify)
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 45000 });
 
-    // Evaluate the page DOM to extract clean text
     const pageText = await page.evaluate(() => {
-      // Remove unnecessary elements that clutter the text for the AI
       const elementsToRemove = document.querySelectorAll('script, style, noscript, nav, footer, header, iframe, svg');
       elementsToRemove.forEach(el => el.remove());
 
-      // Extract the visible inner text
       let text = document.body.innerText || "";
-      
-      // Clean up excessive blank lines and spaces
       text = text.replace(/\n\s*\n/g, '\n\n').trim();
       return text;
     });
 
     await browser.close();
 
-    // Return the clean text to Bubble
     res.status(200).json({ 
       success: true, 
       url: url,
