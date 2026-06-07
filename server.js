@@ -3863,7 +3863,7 @@ app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
 
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-puppeteer.use(StealthPlugin()); // This applies the Cloudflare bypass
+puppeteer.use(StealthPlugin());
 
 app.post('/api/scrape', async (req, res) => {
   const { url } = req.body;
@@ -3881,36 +3881,43 @@ app.post('/api/scrape', async (req, res) => {
         '--disable-setuid-sandbox', 
         '--disable-dev-shm-usage',
         '--disable-gpu',
-        '--disable-blink-features=AutomationControlled' // Extra anti-bot bypass
+        '--disable-blink-features=AutomationControlled'
       ]
     });
 
     const page = await browser.newPage();
-
-    // Set a real human User-Agent
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-    
-    // OPTIMIZATION: Block images, CSS, and fonts
-    await page.setRequestInterception(true);
-    page.on('request', (request) => {
-      const resourceType = request.resourceType();
-      if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
-        request.abort();
-      } else {
-        request.continue();
-      }
-    });
 
-    // Wait until network is mostly idle (Cloudflare needs time to verify)
+    // Go to the URL
     await page.goto(url, { waitUntil: 'networkidle2', timeout: 45000 });
 
-    const pageText = await page.evaluate(() => {
+    // Wait out the Cloudflare challenge if it appears
+    let pageText = "";
+    let attempts = 0;
+    
+    while (attempts < 3) {
+      pageText = await page.evaluate(() => {
+        let text = document.body.innerText || "";
+        return text.trim();
+      });
+
+      // If we see Cloudflare's text, wait 5 seconds and check again
+      if (pageText.includes("Checking the site connection security") || pageText.includes("Just a moment...")) {
+        console.log("Cloudflare detected, waiting 5 seconds...");
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        attempts++;
+      } else {
+        break; // Successfully bypassed!
+      }
+    }
+
+    // Now clean up the actual website text
+    pageText = await page.evaluate(() => {
       const elementsToRemove = document.querySelectorAll('script, style, noscript, nav, footer, header, iframe, svg');
       elementsToRemove.forEach(el => el.remove());
 
       let text = document.body.innerText || "";
-      text = text.replace(/\n\s*\n/g, '\n\n').trim();
-      return text;
+      return text.replace(/\n\s*\n/g, '\n\n').trim();
     });
 
     await browser.close();
@@ -3927,6 +3934,7 @@ app.post('/api/scrape', async (req, res) => {
     res.status(500).json({ error: "Failed to scrape the website.", details: error.message });
   }
 });
+
 
 
 
