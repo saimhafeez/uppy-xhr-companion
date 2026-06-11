@@ -3611,6 +3611,52 @@ function formatExactLocalTime(dateString) {
   return cleaned; // Returns exactly like: 20260529T090000
 }
 
+// ADVANCED HELPER: Convert HTML to plain text with proper spacing and link parsing
+function parseHtmlToPlain(html) {
+  if (!html) return '';
+
+  let text = html;
+
+  // 1. Format Hyperlinks: <a href="URL">TEXT</a> -> TEXT: URL
+  // This regex finds the href value and the inner text of the anchor tag
+  text = text.replace(/<a\s+(?:[^>]*?\s+)?href=["']([^"']+)["'][^>]*>(.*?)<\/a>/gi, (match, url, linkText) => {
+    const cleanUrl = url.trim();
+    // Strip any nested tags inside the link text (like bold/italics) just in case
+    const cleanText = linkText.replace(/<[^>]+>/g, '').trim(); 
+    
+    // If the text is empty or exactly the same as the URL, just return the URL
+    if (!cleanText || cleanText === cleanUrl) {
+      return cleanUrl;
+    }
+    // Otherwise, return "Text: URL"
+    return `${cleanText}: ${cleanUrl}`;
+  });
+
+  // 2. Standard Formatting & Stripping
+  text = text
+    .replace(/<br\s*[\/]?>/gi, '\n')       // Convert <br> to newline
+    .replace(/<\/p>\s*<p[^>]*>/gi, '\n\n') // Convert paragraph breaks to double newline
+    .replace(/<\/p>/gi, '\n')              // End of paragraph to newline
+    .replace(/<p[^>]*>/gi, '')             // Remove opening paragraph tags (handles <p class="...">)
+    .replace(/<[^>]+>/g, '')               // Strip all remaining HTML tags (b, i, span, etc.)
+    .replace(/&nbsp;/g, ' ')               // Decode HTML spaces
+    .replace(/&amp;/g, '&')                // Decode ampersands
+    .replace(/&lt;/g, '<')                 // Decode <
+    .replace(/&gt;/g, '>')                 // Decode >
+    .trim();                               // Clean up leading/trailing whitespace
+
+  return text;
+}
+
+// HELPER: Refine HTML for X-ALT-DESC strict formatting
+function refineHtmlForIcal(html) {
+  if (!html) return '';
+  // Remove actual newline characters so they don't break iCal line parsing,
+  // Wrap in valid DOCTYPE structure required by Outlook/Apple Calendar
+  const cleanHtml = html.replace(/\r?\n/g, ''); 
+  return `<!DOCTYPE HTML><HTML><BODY>${cleanHtml}</BODY></HTML>`;
+}
+
 app.post('/generate_ical', async (req, res) => {
   try {
     const { 
@@ -3640,6 +3686,10 @@ app.post('/generate_ical', async (req, res) => {
     const icalStatus = icalMethod === 'CANCEL' ? 'CANCELLED' : 'CONFIRMED';
     const icalSequence = sequence !== undefined ? sequence : (icalMethod === 'CANCEL' ? '1' : '0'); 
     const partStat = attendee_status.toUpperCase();
+
+    // Process Descriptions
+    const descriptionPlainText = parseHtmlToPlain(description);
+    const descriptionHtml = refineHtmlForIcal(description);
 
     // Build Attendees List
     let attendeeLines = [];
@@ -3681,7 +3731,8 @@ app.post('/generate_ical', async (req, res) => {
       dtStartLine,
       dtEndLine,
       `SUMMARY:${title}`,
-      `DESCRIPTION:${(description || '').replace(/\n/g, '\\n')}`,
+      `DESCRIPTION:${descriptionPlainText.replace(/\n/g, '\\n')}`, // Use standard iCal escaped plain text
+      `X-ALT-DESC;FMTTYPE=text/html:${descriptionHtml}`,           // Insert refined HTML text
       location ? `LOCATION:${location}` : '',
       `ORGANIZER;CN=${organizer_name}:mailto:${organizer_email}`,
       ...attendeeLines, 
@@ -3714,13 +3765,31 @@ app.post('/generate_ical', async (req, res) => {
       ? `https://${wasabiConfig.bucket}.s3${regionStr}.wasabisys.com/${wasabiKey}`
       : `${wasabiConfig.endpoint}/${wasabiConfig.bucket}/${wasabiKey}`;
 
+    // Generate Calendar Web Links
+    // Link format requires trailing Z if UTC, else strict YYYYMMDDTHHMMSS
+    const linkStart = timezone_id ? formatExactLocalTime(start_time) : `${formatExactLocalTime(start_time)}Z`;
+    const linkEnd = timezone_id ? formatExactLocalTime(end_time) : `${formatExactLocalTime(end_time)}Z`;
+    const ctzParam = timezone_id ? `&ctz=${encodeURIComponent(timezone_id)}` : '';
+    const safeLoc = encodeURIComponent(location || '');
+    const safeTitle = encodeURIComponent(title || '');
+    const safeDesc = encodeURIComponent(descriptionPlainText || '');
+
+    const googleLink = `https://calendar.google.com/calendar/render?action=TEMPLATE&text=${safeTitle}&dates=${linkStart}/${linkEnd}&details=${safeDesc}&location=${safeLoc}${ctzParam}`;
+    const outlookLink = `https://outlook.live.com/calendar/0/deeplink/compose?path=/calendar/action/compose&rru=addevent&subject=${safeTitle}&startdt=${linkStart}&enddt=${linkEnd}&body=${safeDesc}&location=${safeLoc}`;
+    const yahooLink = `https://calendar.yahoo.com/?v=60&view=d&type=20&title=${safeTitle}&st=${linkStart}&et=${linkEnd}&desc=${safeDesc}&in_loc=${safeLoc}`;
+
     res.status(200).json({
       ok: true,
       booking_unique_id: booking_unique_id,
       method: icalMethod,
       sequence: icalSequence,
       file_url: fileUrl,
-      base64: base64String
+      base64: base64String,
+      add_to_google_link: googleLink,
+      add_to_outlook_link: outlookLink,
+      add_to_yahoo_link: yahooLink,
+      description_plain_text: descriptionPlainText,
+      description_html: descriptionHtml
     });
 
   } catch (error) {
@@ -3728,9 +3797,6 @@ app.post('/generate_ical', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
-
-
-
 
 
 ///////////////////////////////////////////////////
