@@ -3617,9 +3617,10 @@ function parseHtmlToPlain(html) {
 
   let text = html;
 
-  // 1. Format Hyperlinks: <a href="URL">TEXT</a> -> TEXT: URL
-  // This regex finds the href value and the inner text of the anchor tag
-  text = text.replace(/<a\s+(?:[^>]*?\s+)?href=["']([^"']+)["'][^>]*>(.*?)<\/a>/gi, (match, url, linkText) => {
+  // 1. Format Hyperlinks (Now handles both quoted href="..." and unquoted href=...)
+  text = text.replace(/<a\s+[^>]*href\s*=\s*(?:["']([^"']+)["']|([^"'\s>]+))[^>]*>(.*?)<\/a>/gi, (match, quotedUrl, unquotedUrl, linkText) => {
+    // Pick whichever URL matched (quoted or unquoted)
+    const url = quotedUrl || unquotedUrl;
     const cleanUrl = url.trim();
     // Strip any nested tags inside the link text (like bold/italics) just in case
     const cleanText = linkText.replace(/<[^>]+>/g, '').trim(); 
@@ -3651,9 +3652,13 @@ function parseHtmlToPlain(html) {
 // HELPER: Refine HTML for X-ALT-DESC strict formatting
 function refineHtmlForIcal(html) {
   if (!html) return '';
-  // Remove actual newline characters so they don't break iCal line parsing,
-  // Wrap in valid DOCTYPE structure required by Outlook/Apple Calendar
-  const cleanHtml = html.replace(/\r?\n/g, ''); 
+  
+  // 1. Convert newlines (\n) or literal string "\n" into <br> tags so HTML spacing works
+  let cleanHtml = html
+    .replace(/\\n/g, '<br>') // Handles literal '\n' string
+    .replace(/\n/g, '<br>')  // Handles actual newline characters
+    .replace(/\r/g, '');     // Removes carriage returns to keep iCal syntax valid
+    
   return `<!DOCTYPE HTML><HTML><BODY>${cleanHtml}</BODY></HTML>`;
 }
 
