@@ -3745,7 +3745,14 @@ app.post('/generate_ical', async (req, res) => {
       `ORGANIZER;CN=${organizer_name}:mailto:${organizer_email}`,
       ...attendeeLines, 
       `STATUS:${icalStatus}`, 
-      `SEQUENCE:${icalSequence}`, 
+      `SEQUENCE:${icalSequence}`,
+      // --- ADDED 15 MINUTE REMINDER (VALARM) ---
+      'BEGIN:VALARM',
+      'ACTION:DISPLAY',
+      'DESCRIPTION:Reminder',
+      'TRIGGER:-PT15M',
+      'END:VALARM',
+      // -----------------------------------------
       'END:VEVENT',
       'END:VCALENDAR'
     ].filter(Boolean).join('\r\n');
