@@ -3680,7 +3680,8 @@ app.post('/generate_ical', async (req, res) => {
       method = 'REQUEST', 
       attendee_status = 'NEEDS-ACTION', 
       sequence,
-      timezone_id // e.g., "Asia/Tashkent"
+      timezone_id, // e.g., "Asia/Tashkent"
+      version      // <--- ADD THIS: e.g., "version-test" or empty for live
     } = req.body;
 
     if (!title || !start_time || !end_time || !organizer_email || !booking_unique_id) {
@@ -3713,15 +3714,17 @@ app.post('/generate_ical', async (req, res) => {
       });
     }
 
-    // Determine DTSTART and DTEND lines based on timezone presence
-    // Uses the EXACT string passed in (no Javascript time shifting)
     const dtStartLine = timezone_id 
       ? `DTSTART;TZID=${timezone_id}:${formatExactLocalTime(start_time)}`
-      : `DTSTART:${formatExactLocalTime(start_time)}Z`; // Fallback to UTC format if no timezone
+      : `DTSTART:${formatExactLocalTime(start_time)}Z`; 
       
     const dtEndLine = timezone_id 
       ? `DTEND;TZID=${timezone_id}:${formatExactLocalTime(end_time)}`
       : `DTEND:${formatExactLocalTime(end_time)}Z`;
+
+    // ---> CREATE COMPOSITE UID WITH VERSION <---
+    // If a version is passed, append it. Otherwise, just use the booking ID.
+    const compositeUid = version ? `${booking_unique_id}__V__${version}` : booking_unique_id;
 
     // Construct the iCal string
     const icsContent = [
@@ -3731,13 +3734,13 @@ app.post('/generate_ical', async (req, res) => {
       'CALSCALE:GREGORIAN',
       `METHOD:${icalMethod}`, 
       'BEGIN:VEVENT',
-      `UID:${booking_unique_id}`, 
-      `DTSTAMP:${getCurrentIcalUtc()}`, // DTSTAMP must remain current UTC time
+      `UID:${compositeUid}`, // <--- USE THE COMPOSITE UID HERE
+      `DTSTAMP:${getCurrentIcalUtc()}`,
       dtStartLine,
       dtEndLine,
       `SUMMARY:${title}`,
-      `DESCRIPTION:${descriptionPlainText.replace(/\n/g, '\\n')}`, // Use standard iCal escaped plain text
-      `X-ALT-DESC;FMTTYPE=text/html:${descriptionHtml}`,           // Insert refined HTML text
+      `DESCRIPTION:${descriptionPlainText.replace(/\n/g, '\\n')}`, 
+      `X-ALT-DESC;FMTTYPE=text/html:${descriptionHtml}`,           
       location ? `LOCATION:${location}` : '',
       `ORGANIZER;CN=${organizer_name}:mailto:${organizer_email}`,
       ...attendeeLines, 
@@ -3751,6 +3754,7 @@ app.post('/generate_ical', async (req, res) => {
     const buffer = Buffer.from(icsContent, 'utf-8');
     const base64String = buffer.toString('base64');
 
+    // We can still use the normal booking_unique_id for the filename so it stays clean
     const wasabiConfig = await getWasabiCredentials(member_unique_id);
     const s3Client = createS3Client(wasabiConfig);
     const wasabiKey = `icals/${Date.now()}_${booking_unique_id}.ics`;
@@ -3770,8 +3774,6 @@ app.post('/generate_ical', async (req, res) => {
       ? `https://${wasabiConfig.bucket}.s3${regionStr}.wasabisys.com/${wasabiKey}`
       : `${wasabiConfig.endpoint}/${wasabiConfig.bucket}/${wasabiKey}`;
 
-    // Generate Calendar Web Links
-    // Link format requires trailing Z if UTC, else strict YYYYMMDDTHHMMSS
     const linkStart = timezone_id ? formatExactLocalTime(start_time) : `${formatExactLocalTime(start_time)}Z`;
     const linkEnd = timezone_id ? formatExactLocalTime(end_time) : `${formatExactLocalTime(end_time)}Z`;
     const ctzParam = timezone_id ? `&ctz=${encodeURIComponent(timezone_id)}` : '';
@@ -3804,12 +3806,13 @@ app.post('/generate_ical', async (req, res) => {
 });
 
 
+
 ///////////////////////////////////////////////////
 //////  SendGrid Inbound Parse (RSVP Webhook) /////
 ///////////////////////////////////////////////////
 
 app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
-  res.status(200).send('OK'); // Acknowledge immediately so SendGrid doesn't retry
+  res.status(200).send('OK'); 
 
   const form = new formidable.IncomingForm({
     multiples: true,
@@ -3825,7 +3828,6 @@ app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
     try {
       console.log('=== INBOUND WEBHOOK FIRED ===');
 
-      // 1. Extract the Sender's Email from the header (Fallback)
       let headerSenderEmail = '';
       if (fields.from) {
         const fromField = Array.isArray(fields.from) ? fields.from[0] : fields.from;
@@ -3836,7 +3838,6 @@ app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
       let icsContent = null;
       let filepathToCleanup = null;
 
-      // 2. Try to find the calendar data in attachments
       for (const key of Object.keys(files)) {
         const fileObj = Array.isArray(files[key]) ? files[key][0] : files[key];
         const filename = (fileObj.originalFilename || '').toLowerCase();
@@ -3849,7 +3850,6 @@ app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
         }
       }
 
-      // 3. Fallback: Check text fields if Outlook sent it inline
       if (!icsContent) {
         for (const key of Object.keys(fields)) {
           const val = Array.isArray(fields[key]) ? fields[key][0] : fields[key];
@@ -3865,10 +3865,8 @@ app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
         return;
       }
       
-      // CRITICAL FIX: "Unfold" the iCal lines (Removes line breaks followed by space/tab)
       icsContent = icsContent.replace(/\r?\n[ \t]/g, '');
 
-      // 4. Extract the UID and the PARTSTAT
       const uidMatch = icsContent.match(/UID:(.+)/i);
       const partstatMatch = icsContent.match(/PARTSTAT=([A-Z-]+)/i);
 
@@ -3878,32 +3876,39 @@ app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
         return;
       }
 
-      const unique_id = uidMatch[1].trim();
+      const rawUid = uidMatch[1].trim();
       const status = partstatMatch[1].trim().toLowerCase();
+
+      // ---> PARSE VERSION FROM THE COMPOSITE UID <---
+      let unique_id = rawUid;
+      let targetVersion = "";
+
+      if (rawUid.includes('__V__')) {
+        const parts = rawUid.split('__V__');
+        unique_id = parts[0];
+        targetVersion = parts[1];
+      }
 
       // 5. EXTRACT EMAIL AND NAME FROM iCAL DATA
       let finalAttendeeEmail = headerSenderEmail;
       let finalAttendeeName = ""; 
       
-      // Extract Email
       const attendeeMatch = icsContent.match(/ATTENDEE.*?[mM][aA][iI][lL][tT][oO]:([^\s;]+)/i);
       if (attendeeMatch && attendeeMatch[1]) {
         finalAttendeeEmail = attendeeMatch[1].trim().toLowerCase().replace(/["']/g, '');
-        console.log(`[DEBUG] Extracted email from mailto tag: ${finalAttendeeEmail}`);
-      } else {
-        console.log(`[DEBUG] Could not find mailto: tag. Falling back to Header Email: ${headerSenderEmail}`);
       }
 
-      // Extract Name (CN)
       const cnMatch = icsContent.match(/CN=([^:;]+)/i);
       if (cnMatch && cnMatch[1]) {
         finalAttendeeName = cnMatch[1].trim();
       }
 
-      console.log(`>>> FINAL PAYLOAD TO BUBBLE: RSVP ${status} | UID ${unique_id} | EMAIL ${finalAttendeeEmail} | NAME ${finalAttendeeName} <<<`);
+      console.log(`>>> FINAL PAYLOAD TO BUBBLE: RSVP ${status} | UID ${unique_id} | VERSION ${targetVersion || 'LIVE'} | EMAIL ${finalAttendeeEmail} <<<`);
 
-      // 6. Forward to Bubble
-      const BUBBLE_RSVP_ENDPOINT = "https://upward.page/api/1.1/wf/update_ical_rsvp";
+      // ---> DYNAMICALLY CONSTRUCT THE BUBBLE ENDPOINT <---
+      const BUBBLE_RSVP_ENDPOINT = targetVersion 
+        ? `https://upward.page/${targetVersion}/api/1.1/wf/update_ical_rsvp`
+        : `https://upward.page/api/1.1/wf/update_ical_rsvp`;
       
       await fetch(BUBBLE_RSVP_ENDPOINT, {
         method: "POST",
@@ -3926,6 +3931,7 @@ app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
     }
   });
 });
+
 
 
 ///////////////////////////////////////////////////
