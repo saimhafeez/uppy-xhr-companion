@@ -3635,6 +3635,8 @@ function parseHtmlToPlain(html) {
 
   // 2. Standard Formatting & Stripping
   text = text
+    .replace(/\\n/g, '\n')                 // <--- ADDED THIS LINE: Converts literal '\n' strings to actual newlines
+    .replace(/\\r/g, '')                   // <--- ADDED THIS LINE: Cleans up literal carriage returns just in case
     .replace(/<br\s*[\/]?>/gi, '\n')       // Convert <br> to newline
     .replace(/<\/p>\s*<p[^>]*>/gi, '\n\n') // Convert paragraph breaks to double newline
     .replace(/<\/p>/gi, '\n')              // End of paragraph to newline
@@ -3644,10 +3646,12 @@ function parseHtmlToPlain(html) {
     .replace(/&amp;/g, '&')                // Decode ampersands
     .replace(/&lt;/g, '<')                 // Decode <
     .replace(/&gt;/g, '>')                 // Decode >
+    .replace(/\n\s*\n\s*\n/g, '\n\n')      // <--- ADDED THIS LINE: Prevents massive ugly gaps by capping at double newlines
     .trim();                               // Clean up leading/trailing whitespace
 
   return text;
 }
+
 
 // HELPER: Refine HTML for X-ALT-DESC strict formatting
 function refineHtmlForIcal(html) {
